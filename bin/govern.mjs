@@ -638,7 +638,42 @@ async function handlePreToolUse() {
     }));
     process.exit(0);
   }
+  // A 401/403 is NOT the gateway being down — it is this machine's key
+  // being revoked, mistyped, or from a deleted workspace. Live session
+  // 2026-09-07: a returning user's May key had been revoked; for six hours
+  // every hook call read "gateway unreachable (HTTP 401)", which sounds
+  // like our outage, and the user ran ungoverned until they happened to
+  // visit the console. Same tier posture as an outage (interactive fails
+  // open, unattended stays blocked), but the message names the cause and
+  // the two fixes.
+  function failPostureOnKeyRejected(status) {
+    const tier = resolveAgentTier();
+    const fix = "Fix: re-run the installer (curl -sf https://agenticcontrolplane.com/install.sh | bash) or create a key at https://cloud.agenticcontrolplane.com/settings/api-keys and save it: echo 'gsk_...' > ~/.acp/credentials";
+    if (tier === "interactive") {
+      try {
+        appendFileSync(join(homedir(), ".acp", "lapse.log"),
+          JSON.stringify({ at: new Date().toISOString(), tool: input.tool_name, tier, detail: `key rejected (HTTP ${status})` }) + "\n");
+      } catch { /* best-effort */ }
+      recordPendingLapse(input.session_id, input.tool_name, `key rejected (HTTP ${status})`);
+      process.stdout.write(JSON.stringify({
+        hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "allow" },
+        systemMessage: `[ACP] ⚠ KEY REJECTED (HTTP ${status}): the key in ~/.acp/credentials is revoked or invalid — this call proceeded UNGOVERNED and unlogged, and every call will until it is fixed. ${fix}`,
+      }));
+      process.exit(0);
+    }
+    const msg = `[ACP] Key rejected (HTTP ${status}) — the key in ~/.acp/credentials is revoked or invalid; ${tier} tier stays blocked until it is fixed. ${fix}`;
+    process.stdout.write(JSON.stringify({
+      hookSpecificOutput: {
+        hookEventName: "PreToolUse",
+        permissionDecision: "deny",
+        permissionDecisionReason: `${msg}\n\nThis is a credential failure, NOT a policy judgment about this call. Tell the operator the key needs replacing; do not retry until it is.`,
+      },
+      systemMessage: msg,
+    }));
+    process.exit(0);
+  }
   function denyGatewayError(status, statusText) {
+    if (status === 401 || status === 403) { failPostureOnKeyRejected(status); return; }
     const detail = statusText ? `HTTP ${status} ${statusText}` : `HTTP ${status}`;
     failPostureOnOutage(detail);
   }
