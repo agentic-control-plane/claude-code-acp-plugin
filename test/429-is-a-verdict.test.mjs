@@ -94,12 +94,37 @@ test("400 with a deny body is a verdict too", async () => {
   } finally { server.close(); }
 });
 
-test("bodyless 401 keeps the outage posture (interactive fails open, loudly)", async () => {
+// A 401/403 is a credential failure, not an outage (live session 2026-09-07:
+// a revoked key produced six hours of "gateway unreachable (HTTP 401)").
+// Same tier posture as an outage, but the message names the key and the fix.
+test("401 fails open for an INTERACTIVE session and says KEY REJECTED with the fix, not 'unreachable'", async () => {
   const { server, base } = await stubGateway(401, { ok: false, reason: "unauthenticated" });
   try {
     const r = await runHook(base, { tier: "interactive" });
     assert.equal(r.decision, "allow");
+    assert.match(r.message, /KEY REJECTED \(HTTP 401\)/);
     assert.match(r.message, /UNGOVERNED/);
+    assert.match(r.message, /settings\/api-keys/);
+    assert.doesNotMatch(r.message, /unreachable/i);
+  } finally { server.close(); }
+});
+
+test("401 keeps an unattended tier blocked and names the key, not an outage", async () => {
+  const { server, base } = await stubGateway(401, { ok: false, reason: "unauthenticated" });
+  try {
+    const r = await runHook(base, { tier: "unattended" });
+    assert.equal(r.decision, "deny");
+    assert.match(r.message, /Key rejected \(HTTP 401\)/);
+    assert.doesNotMatch(r.message, /unreachable/i);
+  } finally { server.close(); }
+});
+
+test("403 is treated like 401 (key rejected)", async () => {
+  const { server, base } = await stubGateway(403, { ok: false, reason: "forbidden" });
+  try {
+    const r = await runHook(base, { tier: "interactive" });
+    assert.equal(r.decision, "allow");
+    assert.match(r.message, /KEY REJECTED \(HTTP 403\)/);
   } finally { server.close(); }
 });
 
