@@ -45,7 +45,7 @@
 
 import { readFileSync, appendFileSync, existsSync, mkdirSync, writeFileSync, unlinkSync, readdirSync, statSync } from "fs";
 import { homedir } from "os";
-import { join } from "path";
+import { join, isAbsolute } from "path";
 import { createHash } from "crypto";
 import { pathToFileURL, fileURLToPath } from "url";
 
@@ -66,7 +66,7 @@ const ACP_GOVERN =
   process.env.ACP_API_BASE ||
   "https://govern.agenticcontrolplane.com";
 
-const PLUGIN_VERSION = "0.14.0";
+const PLUGIN_VERSION = "0.15.0";
 
 // Console base for user-facing deep links (session receipt, #606).
 const ACP_CONSOLE =
@@ -121,6 +121,47 @@ function recordPendingLapse(sessionId, toolName, detail) {
 function clearPendingLapse(sessionId) {
   if (!sessionId || sessionId === "unknown") return;
   try { unlinkSync(lapsePendingPath(sessionId)); } catch { /* absent is fine */ }
+}
+
+// Context guard (gatewaystack-connect#1072): size a whole-file read before
+// it happens. The engine's readIntent() says WHICH files a Read / cat / head
+// / tail would pull into context; this measures them (lines + bytes) so the
+// decision — local or gateway — can compare against the policy ceiling. Pure
+// measurement, bounded (files over MEASURE_CAP_BYTES are estimated from
+// size), never throws: an unmeasurable file is simply not guarded.
+const MEASURE_CAP_BYTES = 8 * 1024 * 1024;
+function measureFiles(paths, cwd) {
+  const out = {};
+  for (const p of paths || []) {
+    try {
+      const abs = isAbsolute(p) ? p : join(cwd || process.cwd(), p);
+      const st = statSync(abs);
+      if (!st.isFile()) continue;
+      if (st.size > MEASURE_CAP_BYTES) { out[p] = { lines: Math.ceil(st.size / 40), bytes: st.size, estimated: true }; continue; }
+      const buf = readFileSync(abs);
+      let lines = 0;
+      for (let i = 0; i < buf.length; i++) if (buf[i] === 10) lines++;
+      if (buf.length && buf[buf.length - 1] !== 10) lines++;
+      out[p] = { lines, bytes: buf.length };
+    } catch { /* missing / unreadable: the tool surfaces its own error */ }
+  }
+  return out;
+}
+
+/** { read, files } for the wire and the local engine, or undefined when the
+ *  call is not a whole-file read. One parser (decide.mjs readIntent) sizes
+ *  reads for every harness; the gateway does arithmetic, never shell syntax. */
+async function readContext(input) {
+  try {
+    let mod;
+    try { mod = await import(pathToFileURL(join(ACP_DIR, "decide.mjs")).href); }
+    catch { mod = await import("./decide.mjs"); }
+    if (typeof mod.readIntent !== "function") return undefined;
+    const intent = mod.readIntent(input.tool_name, input.tool_input);
+    if (!intent || intent.targeted) return undefined;
+    const files = measureFiles(intent.paths, input.cwd);
+    return Object.keys(files).length ? { read: intent, files } : undefined;
+  } catch { return undefined; }
 }
 
 // Identifies the calling client to the server (per-client policy routing).
@@ -368,9 +409,15 @@ async function runLocal(input) {
       return;
     }
   }
-  const d = decide(input.tool_name, input.tool_input, policy);
+  const ctx = await readContext(input);
+  const d = decide(input.tool_name, input.tool_input, policy, { ...(ctx || {}), harness: HARNESS });
   audit({ ts: new Date().toISOString(), event: "pre", client: ACP_CLIENT, tool: input.tool_name,
-          classified: d.classified, decision: d.decision, source: d.source, reason: d.reason });
+          classified: d.classified, decision: d.decision, source: d.source, reason: d.reason,
+          // Context guard ledger: what a whole-file read would have put in
+          // context, whether it was blocked (enforce) or only measured (shadow).
+          ...(d.contextGuard ? { contextGuard: { mode: d.contextGuard.mode, via: d.contextGuard.via, lines: d.contextGuard.lines,
+                                                  effectiveLines: d.contextGuard.effectiveLines, estTokens: d.contextGuard.estTokens,
+                                                  maxLines: d.contextGuard.maxLines } } : {}) });
   if (d.decision === "deny") {
     process.stdout.write(JSON.stringify({
       hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: `[ACP] ${d.reason}` },
@@ -538,6 +585,9 @@ async function requestScopedToken(provider) {
 /* ------------------------------------------------------------------ */
 
 async function handlePreToolUse() {
+  // Context guard: the gateway cannot see this machine's files, so the
+  // hook measures what a whole-file read would pull in and sends it along.
+  const toolContext = await readContext(input);
   const body = JSON.stringify({
     tool_name: input.tool_name,
     tool_input: input.tool_input,
@@ -548,6 +598,7 @@ async function handlePreToolUse() {
     agent_tier: resolveAgentTier(),
     permission_mode: input.permission_mode,
     tier_signals: tierSignals(),
+    ...(toolContext ? { tool_context: toolContext } : {}),
   });
 
   // A deny is a control-flow event, not a full stop (gatewaystack-connect#692).

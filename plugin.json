@@ -1,6 +1,6 @@
 {
   "name": "agentic-control-plane",
-  "version": "0.14.0",
+  "version": "0.15.0",
   "description": "Identity, governance, and audit for every Claude Code tool call. Logs all tool usage, enforces policies, and gives teams full visibility \u2014 without changing how you use Claude.",
   "author": {
     "name": "GatewayStack",
