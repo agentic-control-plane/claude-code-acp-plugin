@@ -9,7 +9,7 @@
       "name": "agentic-control-plane",
       "source": "./",
       "description": "Control, audit, and cost-optimize every Claude Code tool call. Governance hook + bundled ACP MCP (cost X-ray, run traces, policy checks) + /cost-xray pre-ship report.",
-      "version": "0.14.0",
+      "version": "0.15.0",
       "author": {
         "name": "GatewayStack"
       },

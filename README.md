@@ -44,6 +44,22 @@ When ACP denies a call, the plugin tells you why with a distinct prefix so you c
 - `[ACP] Gateway error — tool blocked for safety (HTTP X)` — ACP responded with an error (e.g. auth, server crash)
 - `[ACP] Gateway unreachable — tool blocked for safety` — ACP didn't respond at all (timeout, network)
 
+### Context guard (v0.15.0+, off by default)
+
+Whole-file reads are the cheapest thing an agent does and the most expensive thing it puts into a frontier model's context. The hook sizes a read **before** it happens — `Read` (offset/limit-aware) and `cat` / `head` / `tail` / `less` / `more` / `bat` — and sends the line and byte count to the gateway (or the local engine) as `tool_context`. Targeted reads always pass: offset/limit, `head -n 20`, pipes (`cat f | grep x`), redirects, byte ranges, `tail -f`.
+
+The policy block lives on the governance doc (console → Policies → Context guard) or in `~/.acp/policy.json` for local mode:
+
+```json
+"contextGuard": { "maxLines": 350, "mode": "shadow", "action": "deny" }
+```
+
+- `shadow` — allow, but every audit row for a read over the ceiling carries `contextGuard.estTokens`: what it would have put into context. Watch this ledger first.
+- `enforce` — deny (or `ask`) with a reason that always names the sanctioned path: read the section you need, grep for the symbol, or hand the read to a subagent so it stays out of this context. Codex gets `sed -n 'START,ENDp'` instead of offset/limit.
+- No `tool_context` (older hook, unreadable file) — not guarded, never a lapse. The tool surfaces its own error for a missing file.
+
+The ledger counts tokens the frontier model never saw. It does not count what the agent did instead, so read it next to run cost before enforcing.
+
 ### Cross-architecture credential brokering (v0.5.0+, opt-in)
 
 When your workspace has **scoped tokens** enabled (`policies.scopedTokensEnabled: true` in your tenant config), the plugin recognizes calls to known vendors — currently `gh`, `curl api.github.com`, and `git push https://github.com/…` — and:
