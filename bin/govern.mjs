@@ -784,6 +784,13 @@ async function handlePreToolUse() {
 
   let policyAllowed = true;
   let tierNotice = null;
+  // The gateway's human-facing line for THIS call (gatewaystack-connect#429):
+  // the billing grace nag, or a fail-open — "policy could not be read; this
+  // call ran fail-open (not policy-checked)". The field has existed since
+  // billing enforcement landed and this hook never read it, so billing
+  // warned into the void and a fail-open was silent at the terminal.
+  // Relayed every time it arrives: the server owns the frequency.
+  let wireWarning = null;
   let res;
   try {
     try {
@@ -835,6 +842,9 @@ async function handlePreToolUse() {
     if (typeof data.notice === "string" && data.notice.trim() && firstTierNoticeThisSession()) {
       tierNotice = data.notice;
     }
+    if (typeof data.warning === "string" && data.warning.trim()) {
+      wireWarning = data.warning.trim();
+    }
   } catch (err) {
     const reason = err && err.name === "AbortError"
       ? "request timed out twice"
@@ -844,11 +854,17 @@ async function handlePreToolUse() {
   }
 
   // A hook run may write exactly ONE stdout JSON object — every allow-path
-  // exit funnels through here so the tier-divergence notice never produces
-  // a second one.
+  // exit funnels through here so the tier-divergence notice and the wire
+  // warning never produce a second one. Both may fire on one call; they
+  // share the single systemMessage.
+  function allowSystemMessage() {
+    const parts = [tierNotice, wireWarning].filter((s) => typeof s === "string" && s.trim());
+    return parts.length ? parts.join(" ") : null;
+  }
   function exitAllow() {
-    if (tierNotice) {
-      process.stdout.write(JSON.stringify({ systemMessage: tierNotice }));
+    const msg = allowSystemMessage();
+    if (msg) {
+      process.stdout.write(JSON.stringify({ systemMessage: msg }));
     }
     process.exit(0);
   }
@@ -928,7 +944,7 @@ async function handlePreToolUse() {
         permissionDecision: "allow",
         updatedInput: { ...input.tool_input, command: updated },
       },
-      ...(tierNotice ? { systemMessage: tierNotice } : {}),
+      ...(allowSystemMessage() ? { systemMessage: allowSystemMessage() } : {}),
     }));
     process.exit(0);
   }
