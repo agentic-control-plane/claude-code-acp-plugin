@@ -139,10 +139,12 @@ test("no token, no policy.json, no ACP_LOCAL: proceeds but warns UNGOVERNED once
   // hook must never exit silently — that silence is what let installs sit
   // ungoverned for weeks. First call prints the banner; subsequent calls
   // in the same session stay quiet (the marker dedupes).
+  // Since plugin#29 the two floors apply here too, so the fixture is a
+  // benign command — a catastrophic one is now denied (offline-floor.test).
   const bare = mkdtempSync(join(tmpdir(), "acp-local-off-"));
   try {
     const first = spawnSync(process.execPath, [GOVERN], {
-      input: JSON.stringify(pre("rm -rf ~/")),
+      input: JSON.stringify(pre("git status")),
       encoding: "utf8",
       env: { HOME: bare, PATH: process.env.PATH },
       timeout: 15000,
@@ -153,7 +155,7 @@ test("no token, no policy.json, no ACP_LOCAL: proceeds but warns UNGOVERNED once
     assert.equal(out.hookSpecificOutput, undefined, "must not deny — never brick, just warn");
 
     const second = spawnSync(process.execPath, [GOVERN], {
-      input: JSON.stringify(pre("rm -rf ~/")),
+      input: JSON.stringify(pre("git status")),
       encoding: "utf8",
       env: { HOME: bare, PATH: process.env.PATH },
       timeout: 15000,
