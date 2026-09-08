@@ -674,7 +674,19 @@ async function handlePreToolUse() {
       }));
       process.exit(0);
     }
-    // Unattended tier: hold the line, say why honestly.
+    // Unattended tier: hold the line, say why honestly — and leave a record
+    // (gatewaystack-connect#690, fix 3). Confirmed 2026-08-13: the gateway
+    // answered a slow request with an ALLOW after this client had already
+    // aborted and denied, so the server's ledger said allowed while the
+    // agent was blocked, and neither side could see the contradiction.
+    // Same lapse log and same per-session carry as the interactive branch,
+    // with the detail marked so the gateway's row says "blocked
+    // client-side", not "ran ungoverned".
+    try {
+      appendFileSync(join(homedir(), ".acp", "lapse.log"),
+        JSON.stringify({ at: new Date().toISOString(), tool: input.tool_name, tier, detail, posture: "closed" }) + "\n");
+    } catch { /* the lapse log is best-effort — never block on it */ }
+    recordPendingLapse(input.session_id, input.tool_name, `fail-closed (${tier} tier): ${detail}`);
     const outageMsg = `[ACP] Gateway unreachable (${detail}) — ${tier} tier stays blocked when policy can't be consulted (fail-closed for unattended agents; interactive sessions fail open).`;
     process.stdout.write(JSON.stringify({
       hookSpecificOutput: {
