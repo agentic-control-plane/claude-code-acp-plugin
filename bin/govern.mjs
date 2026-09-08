@@ -48,6 +48,7 @@ import { homedir } from "os";
 import { join, isAbsolute } from "path";
 import { createHash } from "crypto";
 import { pathToFileURL, fileURLToPath } from "url";
+import { spawn } from "child_process";
 
 // Data-plane base. Vendor egress proxying (e.g. GH_HOST → /api/v3) must
 // stay on the main gateway — those routes are not served by the
@@ -66,7 +67,7 @@ const ACP_GOVERN =
   process.env.ACP_API_BASE ||
   "https://govern.agenticcontrolplane.com";
 
-const PLUGIN_VERSION = "0.15.0";
+const PLUGIN_VERSION = "0.16.0";
 
 // Console base for user-facing deep links (session receipt, #606).
 const ACP_CONSOLE =
@@ -339,6 +340,183 @@ const LOCAL =
   !REQUIRE_ENROLLMENT &&
   (process.env.ACP_LOCAL === "1" || existsSync(join(ACP_DIR, "policy.json")));
 
+/* ------------------------------------------------------------------ */
+/* Offline floor + local ledger + flush (plugin#29, phase 1)             */
+/* ------------------------------------------------------------------ */
+//
+// Three states where the gateway does not see a call: no key (the on-ramp),
+// key but unreachable (an outage), and LOCAL policy mode. In every one of
+// them the two floors still run — hardline denies, destructive asks — and
+// the call is recorded to a local append-only ledger. Nothing leaves the
+// machine without a key. On the first governed call after a gap, or at
+// SessionStart with a key, the ledger is flushed once to the gateway in a
+// detached child (never on the hook's critical path) so the console shows
+// history from the first call, not from the connect click.
+//
+// Why: local never phoned home, so ACP could not tell whether an install
+// had zero calls or a thousand; and the no-key path allowed everything with
+// a warning and never ran a floor. The ledger is the instrument; the floors
+// are the minimum a hook must do when it cannot ask anyone.
+
+const LEDGER = join(ACP_DIR, "ledger.jsonl");
+const LEDGER_MAX_BYTES = 5 * 1024 * 1024;
+const LEDGER_FLUSH_BATCH = 500;
+const LEDGER_FLUSH_LOCK_MS = 60_000;
+const LEDGER_FLUSH_BACKOFF_MS = 5 * 60_000;
+
+// The decision engine: the installed copy (~/.acp/decide.mjs, kept current
+// by the installer) when it carries the floors this hook needs, else the
+// copy bundled next to this file. Loaded once per hook invocation; a
+// missing engine degrades to "no floors" — the existing loud-lapse paths
+// still say the call ran ungoverned.
+async function loadEngine() {
+  for (const spec of [pathToFileURL(join(ACP_DIR, "decide.mjs")).href, "./decide.mjs"]) {
+    try {
+      const m = await import(spec);
+      if (typeof m.decide === "function" && typeof m.hardlineFloor === "function" && typeof m.destructiveFloor === "function") return m;
+    } catch { /* try the next */ }
+  }
+  return null;
+}
+const ENGINE = await loadEngine();
+
+/** Append one row for a call the gateway did not see. Bounded: past the
+ *  size cap the oldest half is dropped. Never throws, never blocks. */
+function ledgerRecord(input, d) {
+  try {
+    const ev = typeof input?.hook_event_name === "string" ? input.hook_event_name : "PreToolUse";
+    if (ev !== "PreToolUse") return;
+    const ts = new Date().toISOString();
+    const preview = JSON.stringify(input.tool_input ?? null).slice(0, 500);
+    const id = createHash("sha256").update(`${ts}|${input.tool_name ?? ""}|${preview}|${input.session_id ?? ""}`).digest("hex").slice(0, 32);
+    const row = {
+      id, ts, harness: HARNESS, client: ACP_CLIENT, plugin_version: PLUGIN_VERSION,
+      session_id: input.session_id ?? null, cwd: input.cwd ?? null,
+      tool: input.tool_name ?? null,
+      classified: d.classified ?? (ENGINE ? ENGINE.classifyTool(input.tool_name, input.tool_input) : null),
+      decision: d.decision, source: d.source, reason: d.reason ?? null, mode: d.mode,
+      input_preview: preview,
+    };
+    mkdirSync(ACP_DIR, { recursive: true });
+    try {
+      if (statSync(LEDGER).size > LEDGER_MAX_BYTES) {
+        const lines = readFileSync(LEDGER, "utf8").split("\n").filter(Boolean);
+        writeFileSync(LEDGER, `${lines.slice(Math.floor(lines.length / 2)).join("\n")}\n`);
+      }
+    } catch { /* no ledger yet */ }
+    appendFileSync(LEDGER, `${JSON.stringify(row)}\n`);
+  } catch { /* the ledger is best-effort — never block a call on it */ }
+}
+
+function ledgerCount() {
+  try { return readFileSync(LEDGER, "utf8").split("\n").filter(Boolean).length; } catch { return 0; }
+}
+
+/** Floors for a call the gateway cannot judge. Emits the decision and
+ *  records the row when a floor fires; returns true in that case. */
+function applyOfflineFloors(input, mode) {
+  const ev = typeof input?.hook_event_name === "string" ? input.hook_event_name : "PreToolUse";
+  if (ev !== "PreToolUse" || !ENGINE) return false;
+  const hard = ENGINE.hardlineFloor(input.tool_name, input.tool_input);
+  if (hard) {
+    ledgerRecord(input, { decision: "deny", source: "hardline", reason: hard, mode });
+    const reason = `[ACP] Blocked by the safety floor: ${hard}. This cannot be allowed by any policy or approval — do not retry or route around it.`;
+    process.stdout.write(JSON.stringify({
+      hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: reason },
+      systemMessage: reason,
+    }));
+    return true;
+  }
+  const soft = ENGINE.destructiveFloor(input.tool_name, input.tool_input, { cwd: input.cwd });
+  if (soft) {
+    ledgerRecord(input, { decision: "ask", source: "destructive-floor", reason: soft, mode });
+    const why = mode === "no-key"
+      ? "ACP has no key on this machine, so nobody can approve it remotely"
+      : "the gateway could not be reached, so nobody can approve it remotely";
+    if (HARNESS === "codex") {
+      const reason = `[ACP] Destructive floor (${soft}) — ${why}. Codex cannot ask mid-run, so the call is blocked; a human runs it, or connects a key.`;
+      process.stdout.write(JSON.stringify({
+        hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: reason },
+        systemMessage: reason,
+      }));
+    } else {
+      process.stdout.write(JSON.stringify({
+        hookSpecificOutput: {
+          hookEventName: "PreToolUse",
+          permissionDecision: "ask",
+          permissionDecisionReason: `[ACP] Destructive floor: ${soft} — ${why}; the human at this terminal is being asked.`,
+        },
+      }));
+    }
+    return true;
+  }
+  return false;
+}
+
+/** Upload the ledger, oldest first, in batches; drop what was accepted.
+ *  Runs in a detached child (`govern.mjs --flush`), never in the hook. A
+ *  failed batch sets a backoff so an outage does not retry on every call. */
+async function flushLedger() {
+  if (!token) return;
+  let lines;
+  try { lines = readFileSync(LEDGER, "utf8").split("\n").filter(Boolean); } catch { return; }
+  if (!lines.length) return;
+  const backoffPath = join(ACP_DIR, "ledger.flush-backoff");
+  try { if (Number(readFileSync(backoffPath, "utf8")) > Date.now()) return; } catch { /* no backoff */ }
+  const rows = [];
+  for (const l of lines) { try { rows.push(JSON.parse(l)); } catch { /* skip a torn line */ } }
+  let sent = 0;
+  for (let i = 0; i < rows.length; i += LEDGER_FLUSH_BATCH) {
+    const batch = rows.slice(i, i + LEDGER_FLUSH_BATCH);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 10_000);
+    try {
+      const res = await fetch(`${ACP_GOVERN}/govern/ledger/flush`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json", "X-GS-Client": `${ACP_CLIENT}/${PLUGIN_VERSION}` },
+        body: JSON.stringify({ harness: HARNESS, plugin_version: PLUGIN_VERSION, rows: batch }),
+        signal: controller.signal,
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      sent += batch.length;
+    } catch (e) {
+      if (process.env.ACP_DEBUG) console.error("[ACP] ledger flush failed:", e?.message ?? e);
+      try { writeFileSync(backoffPath, String(Date.now() + LEDGER_FLUSH_BACKOFF_MS)); } catch { /* best-effort */ }
+      break;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+  if (sent > 0) {
+    // Rows appended while flushing are kept: re-read and drop only what
+    // was accepted, from the front.
+    try {
+      const now = readFileSync(LEDGER, "utf8").split("\n").filter(Boolean);
+      const rest = now.slice(sent);
+      writeFileSync(LEDGER, rest.length ? `${rest.join("\n")}\n` : "");
+    } catch { /* best-effort */ }
+    try { unlinkSync(backoffPath); } catch { /* absent is fine */ }
+  }
+}
+
+/** Spawn the flush when there is something to send, at most once a minute. */
+function maybeSpawnFlush() {
+  if (!token) return;
+  try { if (!(statSync(LEDGER).size > 0)) return; } catch { return; }
+  const lock = join(ACP_DIR, "ledger.flush-lock");
+  try { if (Date.now() - statSync(lock).mtimeMs < LEDGER_FLUSH_LOCK_MS) return; } catch { /* no lock */ }
+  try { writeFileSync(lock, String(process.pid)); } catch { /* best-effort */ }
+  try {
+    const child = spawn(process.execPath, [fileURLToPath(import.meta.url), "--flush"], { detached: true, stdio: "ignore", env: process.env });
+    child.unref();
+  } catch { /* a flush that cannot start is retried on the next call */ }
+}
+
+if (process.argv.includes("--flush")) {
+  await flushLedger();
+  process.exit(0);
+}
+
 // Read stdin via async iteration, not readFileSync("/dev/stdin"): on Linux a
 // non-blocking pipe makes the sync read throw EAGAIN, which would silently
 // skip governance for every call. (Caught by CI on ubuntu in acp-install.)
@@ -365,6 +543,10 @@ if (!token && !LOCAL) {
     blockUnenrolled(input);
     process.exit(0);
   }
+  // The on-ramp: no key, no local policy. Floors still apply, and the call
+  // is recorded locally so the history exists the day a key is connected.
+  if (applyOfflineFloors(input, "no-key")) process.exit(0);
+  ledgerRecord(input, { decision: "allow", source: "ungoverned", reason: "no credentials", mode: "no-key" });
   warnUncredentialed(input);
   process.exit(0);
 }
@@ -410,7 +592,10 @@ async function runLocal(input) {
     }
   }
   const ctx = await readContext(input);
-  const d = decide(input.tool_name, input.tool_input, policy, { ...(ctx || {}), harness: HARNESS });
+  const d = decide(input.tool_name, input.tool_input, policy, { ...(ctx || {}), harness: HARNESS, cwd: input.cwd });
+  // The ledger mirrors audit.jsonl for local-policy calls so a later connect
+  // uploads them too (mode tells the console which rules decided).
+  ledgerRecord(input, { decision: d.decision, source: d.source, reason: d.reason, classified: d.classified, mode: "local-policy" });
   audit({ ts: new Date().toISOString(), event: "pre", client: ACP_CLIENT, tool: input.tool_name,
           classified: d.classified, decision: d.decision, source: d.source, reason: d.reason,
           // Context guard ledger: what a whole-file read would have put in
@@ -585,6 +770,9 @@ async function requestScopedToken(provider) {
 /* ------------------------------------------------------------------ */
 
 async function handlePreToolUse() {
+  // A governed call is the first chance after a gap to upload what the
+  // ledger holds. Detached; the gateway call below is not delayed by it.
+  maybeSpawnFlush();
   // Context guard: the gateway cannot see this machine's files, so the
   // hook measures what a whole-file read would pull in and sends it along.
   const toolContext = await readContext(input);
@@ -659,7 +847,12 @@ async function handlePreToolUse() {
   // not being able to ASK the policy.
   function failPostureOnOutage(detail) {
     const tier = resolveAgentTier();
+    // Floors first, in every tier (plugin#29): an outage never lets a
+    // hardline or destructive call through, and the row is in the ledger
+    // for the flush that follows recovery.
+    if (applyOfflineFloors(input, "unreachable")) process.exit(0);
     if (tier === "interactive") {
+      ledgerRecord(input, { decision: "allow", source: "ungoverned", reason: `gateway unreachable (${detail})`, mode: "unreachable" });
       // Lapse, loudly, and leave an audit trail ACP never saw.
       try {
         appendFileSync(join(homedir(), ".acp", "lapse.log"),
@@ -681,12 +874,14 @@ async function handlePreToolUse() {
     // agent was blocked, and neither side could see the contradiction.
     // Same lapse log and same per-session carry as the interactive branch,
     // with the detail marked so the gateway's row says "blocked
-    // client-side", not "ran ungoverned".
+    // client-side", not "ran ungoverned". The offline ledger (plugin#29)
+    // gets the same row so a later flush carries it too.
     try {
       appendFileSync(join(homedir(), ".acp", "lapse.log"),
         JSON.stringify({ at: new Date().toISOString(), tool: input.tool_name, tier, detail, posture: "closed" }) + "\n");
     } catch { /* the lapse log is best-effort — never block on it */ }
     recordPendingLapse(input.session_id, input.tool_name, `fail-closed (${tier} tier): ${detail}`);
+    ledgerRecord(input, { decision: "deny", source: "fail-closed", reason: `gateway unreachable (${detail})`, mode: "unreachable" });
     const outageMsg = `[ACP] Gateway unreachable (${detail}) — ${tier} tier stays blocked when policy can't be consulted (fail-closed for unattended agents; interactive sessions fail open).`;
     process.stdout.write(JSON.stringify({
       hookSpecificOutput: {
@@ -712,6 +907,8 @@ async function handlePreToolUse() {
   function failPostureOnKeyRejected(status) {
     const tier = resolveAgentTier();
     const fix = "Fix: re-run the installer (curl -sf https://agenticcontrolplane.com/install.sh | bash) or create a key at https://cloud.agenticcontrolplane.com/settings/api-keys and save it: echo 'gsk_...' > ~/.acp/credentials";
+    if (applyOfflineFloors(input, "key-rejected")) process.exit(0);
+    ledgerRecord(input, { decision: tier === "interactive" ? "allow" : "deny", source: tier === "interactive" ? "ungoverned" : "fail-closed", reason: `key rejected (HTTP ${status})`, mode: "key-rejected" });
     if (tier === "interactive") {
       try {
         appendFileSync(join(homedir(), ".acp", "lapse.log"),
@@ -1052,6 +1249,16 @@ function sha256FileHex(path) {
 }
 
 async function handleSessionStart() {
+  // Connect moment (plugin#29): a session starting with a key and a
+  // non-empty ledger is either a fresh connect or the first session after
+  // an outage. Say what is about to upload, once, then flush detached.
+  const buffered = ledgerCount();
+  if (buffered > 0) {
+    process.stdout.write(JSON.stringify({
+      systemMessage: `[ACP] ${buffered} tool call${buffered === 1 ? "" : "s"} recorded while ACP could not see them (offline, or before this key was connected) are uploading once now; they will appear in your audit with their original timestamps.`,
+    }));
+    maybeSpawnFlush();
+  }
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 4000);
   try {

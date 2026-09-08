@@ -34,7 +34,16 @@ The plugin registers a **PreToolUse hook** that fires before every tool call:
 3. Returns `allow` or `deny`
 4. All calls are logged — to `~/.acp/audit.jsonl` on-device, or your workspace's audit trail when connected
 
-The hook **fails open** on network errors — ACP outages never block Claude Code.
+The hook **fails open** on network errors in an interactive session — ACP outages never block Claude Code — but never silently, and never below the floors (see next section).
+
+### Offline floor and local ledger (v0.16.0+)
+
+Whenever the gateway cannot see a call — no key on this machine yet, key present but the gateway unreachable, or `--local` mode — the hook still does two things:
+
+1. **Applies the two floors.** The hardline floor denies catastrophic commands (wiping root or home, formatting disks, fork bombs). The destructive floor asks a human before a force push, destructive SQL handed to a database client, a remote download piped into a shell, or a recursive delete outside the working directory. Everything else proceeds with a loud warning. The floors read what will *execute*, not what appears: a heredoc written to a file or a quoted string never trips them.
+2. **Records the call** to `~/.acp/ledger.jsonl` — tool, classification, decision, reason, timestamp, session. Bounded at 5 MB; nothing leaves the machine without a key.
+
+When a key is connected (or the gateway comes back), the ledger uploads **once**, in the background, and the calls appear in your workspace audit with their original timestamps. Connect after two weeks of local use and the console shows two weeks of history, not an empty page. Buffered rows are a record, not a decision: they are never re-evaluated against workspace policy, and they never count as new agents on your plan.
 
 ### Deny messages — three categories
 
