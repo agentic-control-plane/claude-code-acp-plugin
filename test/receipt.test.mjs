@@ -54,7 +54,7 @@ test("receipt message: only what happened, deep link to this session", () => {
   const msg = buildReceiptMessage({ calls: 214, flagged: 0, notices: 3 }, "sess-9", CONSOLE);
   assert.equal(
     msg,
-    "[ACP] Session receipt: 214 tool calls governed · 3 shadow notices — review this session: https://cloud.agenticcontrolplane.com/sessions/sess-9",
+    "[ACP] Session receipt: 214 tool calls governed · 3 shadow notices — review this session: https://cloud.agenticcontrolplane.com/sessions/sess-9 · /acp-status shows what enforcement would have held",
   );
   const flaggedMsg = buildReceiptMessage({ calls: 2, flagged: 1, notices: 0 }, "s", CONSOLE);
   assert.ok(flaggedMsg.includes("2 tool calls governed · 1 flagged"));

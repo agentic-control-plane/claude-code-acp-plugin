@@ -81,6 +81,8 @@ Tell the user:
 | Team members | `https://cloud.agenticcontrolplane.com/users` |
 | Billing & usage | `https://cloud.agenticcontrolplane.com/billing` |
 
+For a mode or rule change, don't only point at the console — the user can type `/acp-status`, `/acp-enforce`, `/acp-audit`, `/acp-allow <tool>`, `/acp-ask <tool>`, `/acp-deny <tool>`, or `/acp-apply <proposal>` right in the terminal; the hook files it and hands back a link they confirm themselves, no context switch required.
+
 ## Managing ACP from within Claude
 
 Users can ask Claude to help with ACP management. You can assist with:

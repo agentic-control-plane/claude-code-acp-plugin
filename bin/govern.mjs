@@ -67,7 +67,7 @@ const ACP_GOVERN =
   process.env.ACP_API_BASE ||
   "https://govern.agenticcontrolplane.com";
 
-const PLUGIN_VERSION = "0.19.0";
+const PLUGIN_VERSION = "0.20.0";
 
 // Console base for user-facing deep links (session receipt, #606).
 const ACP_CONSOLE =
@@ -613,13 +613,19 @@ try {
   process.exit(0);
 }
 
+// UserPromptExpansion (the /acp-* terminal commands) owns its own
+// no-credential message — "/acp-connect first", not the tool-call floors
+// below, and only when the human actually typed one of our commands. Let it
+// fall through to the dispatch at the bottom untouched.
+const EARLY_HOOK_EVENT = typeof input?.hook_event_name === "string" ? input.hook_event_name : "PreToolUse";
+
 // Wired but uncredentialed: the hook runs on every call and has nothing to
 // authenticate with, so each one proceeds unchecked. Never brick — but NEVER
 // silently, the same contract the unreachable-gateway and missing-engine
 // paths already honor. This branch was the exception, and that silence is
 // what let installs sit ungoverned for weeks while the installer reported
 // success and the server saw a workspace indistinguishable from unused.
-if (!token && !LOCAL) {
+if (!token && !LOCAL && EARLY_HOOK_EVENT !== "UserPromptExpansion") {
   if (REQUIRE_ENROLLMENT) {
     blockUnenrolled(input);
     process.exit(0);
@@ -632,7 +638,7 @@ if (!token && !LOCAL) {
   process.exit(0);
 }
 
-if (LOCAL) {
+if (LOCAL && EARLY_HOOK_EVENT !== "UserPromptExpansion") {
   await runLocal(input);
   process.exit(0);
 }
@@ -1473,13 +1479,21 @@ async function handleSessionStart() {
     // session by construction: attest runs at SessionStart only.
     // Canonical logic in lib/attestation.mjs (attestNoticeOutput).
     const data = await res.json().catch(() => null);
+    // The daily offer (gatewaystack-connect govern/terminalOffer.ts): what
+    // enforcement would have held this week and the command that turns it
+    // on. Human channel only — it names a command for the HUMAN to type.
+    // The gateway sends it at most once per day per workspace.
+    const offer = data && typeof data.offer === "string" && data.offer.trim() ? data.offer.trim() : null;
     if (data && typeof data.notice === "string" && data.notice.trim()) {
       process.stdout.write(JSON.stringify({
         hookSpecificOutput: {
           hookEventName: "SessionStart",
           additionalContext: data.notice.trim(),
         },
+        ...(offer ? { systemMessage: offer } : {}),
       }));
+    } else if (offer) {
+      process.stdout.write(JSON.stringify({ systemMessage: offer }));
     }
   } catch {
     // silent — absence of attestation is visible server-side by design
@@ -1539,7 +1553,11 @@ function buildReceiptLine(stats, sessionId) {
   const parts = [`${stats.calls} tool call${stats.calls === 1 ? "" : "s"} governed`];
   if (stats.flagged > 0) parts.push(`${stats.flagged} flagged`);
   if (stats.notices > 0) parts.push(`${stats.notices} shadow notice${stats.notices === 1 ? "" : "s"}`);
-  return `[ACP] Session receipt: ${parts.join(" · ")} — review this session: ${ACP_CONSOLE}/sessions/${encodeURIComponent(String(sessionId))}`;
+  // A shadow notice only ever fires in audit mode, so notices > 0 means
+  // enforcement would have held something this session. Name the read-only
+  // command that shows the list; /acp-status works in every workspace.
+  const next = stats.notices > 0 ? ` · /acp-status shows what enforcement would have held` : "";
+  return `[ACP] Session receipt: ${parts.join(" · ")} — review this session: ${ACP_CONSOLE}/sessions/${encodeURIComponent(String(sessionId))}${next}`;
 }
 
 // One line at session end: what ACP governed, anything it said, and a
@@ -1559,8 +1577,96 @@ function handleStop() {
   process.exit(0);
 }
 
+/* ------------------------------------------------------------------ */
+/* UserPromptExpansion — /acp-* commands typed by the human              */
+/* ------------------------------------------------------------------ */
+
+// A slash command the HUMAN types reaches this hook before it expands into
+// a prompt; the model cannot author this event. The hook turns the command
+// into a pending intent on the gateway (POST /plugin/intents) and prints
+// the signed confirm link the gateway hands back — then BLOCKS the
+// expansion, so the model never sees the command, its body, or the link
+// as a prompt. The human taps the link; that tap is what changes policy,
+// as the human, through the same writers the console uses. The workspace
+// key on this machine never writes policy (#245).
+//
+// Note the link is printed on the human channel, which the harness also
+// writes to the transcript. That is fine by design: the link executes only
+// the intent the human already typed, as that human, once, inside its TTL
+// — nothing a reader of the transcript can redirect.
+const INTENT_COMMAND_RE = /(?:^|:)acp-(enforce|audit|allow|ask|deny|apply|status)$/;
+
+function blockExpansion(reason) {
+  process.stdout.write(JSON.stringify({ decision: "block", reason }));
+  process.exit(0);
+}
+
+async function handleUserPromptExpansion() {
+  const name = typeof input.command_name === "string" ? input.command_name : "";
+  const m = INTENT_COMMAND_RE.exec(name);
+  if (!m) process.exit(0); // not ours — let it expand
+  // Subagents don't get to file workspace changes on the human's behalf.
+  if (typeof input.agent_id === "string" && input.agent_id) process.exit(0);
+  const kind = m[1];
+  const target = typeof input.command_args === "string" ? input.command_args.trim().split(/\s+/)[0] || "" : "";
+
+  if (!token) {
+    blockExpansion(`[ACP] Not connected — /acp-${kind} needs a workspace key. Run /acp-connect first.`);
+  }
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 6000);
+  try {
+    if (kind === "status") {
+      const res = await fetch(`${ACP_API}/plugin/intents/status`, { method: "GET", headers, signal: controller.signal });
+      const s = await res.json().catch(() => null);
+      if (!res.ok || !s?.ok) {
+        blockExpansion(`[ACP] Couldn't read workspace status (HTTP ${res.status}). Console: ${ACP_CONSOLE}/policies`);
+      }
+      const rules = Array.isArray(s.rules) && s.rules.length
+        ? s.rules.map((r) => `  ${r.tool}: ${r.interactive === "step_up" ? "ask" : r.interactive ?? "-"}`).join("\n")
+        : "  (no per-tool rules)";
+      const proposals = Array.isArray(s.proposals) && s.proposals.length
+        ? "\nProposals waiting for you:\n" + s.proposals.map((p) => `  ${p.id}  ${p.tool} → ${p.permission === "step_up" ? "ask" : p.permission}  (${p.source ?? "agent"})   /acp-apply ${p.id}`).join("\n")
+        : "";
+      const asks = Array.isArray(s.pendingApprovals) && s.pendingApprovals.length
+        ? `\nPending approvals: ${s.pendingApprovals.length} (${ACP_CONSOLE}/approvals)`
+        : "";
+      const next = s.mode === "enforce"
+        ? "/acp-allow <tool> stops the asking for one tool; /acp-audit records only."
+        : "/acp-enforce turns the starter rules on so they ask first.";
+      blockExpansion(`[ACP] ${s.workspace} is in ${s.mode} mode.\nInteractive rules:\n${rules}${proposals}${asks}\n${next}`);
+    }
+
+    const res = await fetch(`${ACP_API}/plugin/intents`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ kind, target, session_id: input.session_id, client: ACP_CLIENT }),
+      signal: controller.signal,
+    });
+    const data = await res.json().catch(() => null);
+    if (res.status === 404 && data?.error === "not-rolled-out") {
+      blockExpansion(`[ACP] Terminal commands aren't on for this workspace yet. Console: ${ACP_CONSOLE}/policies`);
+    }
+    if (!res.ok || !data?.ok) {
+      const hint = data?.hint ? ` ${data.hint}` : "";
+      blockExpansion(`[ACP] /acp-${kind} not filed (${data?.error ?? `HTTP ${res.status}`}).${hint}`);
+    }
+    const mins = Math.max(1, Math.round((data.expiresInSeconds ?? 600) / 60));
+    blockExpansion(
+      `[ACP] ${data.describe}\n\nConfirm (you, not the agent): ${data.confirm}\n` +
+      `Expires in ${mins} min. Nothing changes until you open that link and tap Confirm.`,
+    );
+  } catch (err) {
+    blockExpansion(`[ACP] Couldn't reach ACP to file /acp-${kind} (${err?.name === "AbortError" ? "timeout" : err?.message ?? "network error"}). Console: ${ACP_CONSOLE}/policies`);
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 const hookEvent = typeof input.hook_event_name === "string" ? input.hook_event_name : "PreToolUse";
 if (hookEvent === "PostToolUse") handlePostToolUse();
 else if (hookEvent === "SessionStart") handleSessionStart();
 else if (hookEvent === "Stop") handleStop();
+else if (hookEvent === "UserPromptExpansion") handleUserPromptExpansion();
 else handlePreToolUse();

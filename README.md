@@ -71,6 +71,10 @@ When ACP denies a call, the plugin tells you why with a distinct prefix so you c
 
 Not every step_up has to end at a console link. When a workspace rule says ask and you're in an interactive session, this plugin declares that Claude Code can render its own permission prompt, and the policy may answer with a live dialog right there in the terminal instead of a deny. Say yes and the call runs once — the approval is recorded as answered from the terminal, same as any other decision. Say no and the call simply doesn't run; nothing is retried automatically. Unattended tiers and harnesses that can't show a prompt still get the deny + link they always did.
 
+### Commands
+
+Type `/acp-status`, `/acp-enforce`, `/acp-audit`, `/acp-allow <tool>`, `/acp-ask <tool>`, `/acp-deny <tool>`, or `/acp-apply <proposal>` in the terminal to check or change how your workspace is governed without leaving the session. The hook files exactly what you typed and prints a link back — nothing changes until you open it and tap Confirm, so a stray or injected command can't move policy on its own. A confirmed change applies to the whole workspace, the same as making it in the console; if you're not an admin, your request is filed for one to review.
+
 ### Context guard (v0.15.0+, off by default)
 
 Whole-file reads are the cheapest thing an agent does and the most expensive thing it puts into a frontier model's context. The hook sizes a read **before** it happens — `Read` (offset/limit-aware) and `cat` / `head` / `tail` / `less` / `more` / `bat` — and sends the line and byte count to the gateway (or the local engine) as `tool_context`. Targeted reads always pass: offset/limit, `head -n 20`, pipes (`cat f | grep x`), redirects, byte ranges, `tail -f`.
