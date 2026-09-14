@@ -53,6 +53,10 @@ When ACP denies a call, the plugin tells you why with a distinct prefix so you c
 - `[ACP] Gateway error — tool blocked for safety (HTTP X)` — ACP responded with an error (e.g. auth, server crash)
 - `[ACP] Gateway unreachable — tool blocked for safety` — ACP didn't respond at all (timeout, network)
 
+### Approval requests (v0.17.0+)
+
+Not every step_up has to end at a console link. When a workspace rule says ask and you're in an interactive session, this plugin declares that Claude Code can render its own permission prompt, and the policy may answer with a live dialog right there in the terminal instead of a deny. Say yes and the call runs once — the approval is recorded as answered from the terminal, same as any other decision. Say no and the call simply doesn't run; nothing is retried automatically. Unattended tiers and harnesses that can't show a prompt still get the deny + link they always did.
+
 ### Context guard (v0.15.0+, off by default)
 
 Whole-file reads are the cheapest thing an agent does and the most expensive thing it puts into a frontier model's context. The hook sizes a read **before** it happens — `Read` (offset/limit-aware) and `cat` / `head` / `tail` / `less` / `more` / `bat` — and sends the line and byte count to the gateway (or the local engine) as `tool_context`. Targeted reads always pass: offset/limit, `head -n 20`, pipes (`cat f | grep x`), redirects, byte ranges, `tail -f`.

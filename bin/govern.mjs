@@ -67,7 +67,7 @@ const ACP_GOVERN =
   process.env.ACP_API_BASE ||
   "https://govern.agenticcontrolplane.com";
 
-const PLUGIN_VERSION = "0.16.0";
+const PLUGIN_VERSION = "0.17.0";
 
 // Console base for user-facing deep links (session receipt, #606).
 const ACP_CONSOLE =
@@ -786,6 +786,15 @@ async function handlePreToolUse() {
     agent_tier: resolveAgentTier(),
     permission_mode: input.permission_mode,
     tier_signals: tierSignals(),
+    // Declares that THIS harness can render a native permission prompt, so
+    // the gateway may answer a step_up with "ask" instead of falling back
+    // to deny + a console link. Codex's parser only acts on "deny" (see the
+    // HARNESS note above) — it must not declare this, or an "ask" verdict
+    // would mark the hook run failed and let the call through unreviewed.
+    // The gateway keys native ask off this declaration plus the
+    // server-resolved tier, permission_mode, and the harness_ask rollout
+    // (govern/harnessAsk.ts, server-side). Never sent on PostToolUse.
+    capabilities: HARNESS === "codex" ? [] : ["native_ask"],
     ...(toolContext ? { tool_context: toolContext } : {}),
   });
 
@@ -949,7 +958,7 @@ async function handlePreToolUse() {
     // spelled out; Claude Code renders a prompt and the human answers it.
     const steer = decision === "deny"
       ? "Codex cannot ask mid-run, so this arrives as a block. A human approves it on the dashboard and the re-run passes under the grant — continue with the rest of your task meanwhile."
-      : "A human is being asked now. This refused ONE operation, not your task.";
+      : "A human is being asked now in this terminal. This holds ONE operation, not your task; if they say no, do not retry the same command — do something else or ask them.";
     process.stdout.write(JSON.stringify({
       hookSpecificOutput: {
         hookEventName: "PreToolUse",
