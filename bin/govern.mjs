@@ -807,6 +807,99 @@ function firstTierNoticeThisSession() {
   return true;
 }
 
+/* ── Stale-hook notice ──
+ *
+ * A production tenant ran hook 0.4.0 while main was 0.16.0, and two
+ * hardline/tamper denies RAN ANYWAY on that stale hook
+ * (hook.enforcement_diverged). The gateway sends X-ACP-Latest-Version and
+ * X-ACP-Min-Good-Version on every hook response (and latestVersion /
+ * minGoodVersion in the attest body); this hook compares them with its own
+ * version and says so — once per 24h across all events, on stderr and on
+ * the event's existing notice channel. Advisory only: it never downloads,
+ * never executes, never blocks, adds no await before the verdict, and
+ * touches nothing but ~/.acp/.stale-notice. Canonical copy of the logic
+ * lives in lib/staleNotice.mjs for the test suite — keep both in sync. */
+const STALE_NOTICE_MARKER = join(ACP_DIR, ".stale-notice");
+const STALE_NOTICE_TTL_MS = 24 * 60 * 60 * 1000;
+
+function parseSemver(v) {
+  if (typeof v !== "string") return null;
+  const m = v.trim().match(/^v?(\d+)\.(\d+)\.(\d+)/);
+  if (!m) return null;
+  return [Number(m[1]), Number(m[2]), Number(m[3])];
+}
+
+function compareSemver(a, b) {
+  const pa = parseSemver(a);
+  const pb = parseSemver(b);
+  if (!pa || !pb) return 0;
+  for (let i = 0; i < 3; i++) {
+    if (pa[i] !== pb[i]) return pa[i] < pb[i] ? -1 : 1;
+  }
+  return 0;
+}
+
+function readVersionHeaders(res) {
+  const get = (name) => {
+    try {
+      const v = res?.headers?.get?.(name);
+      return typeof v === "string" && v.trim() ? v.trim() : null;
+    } catch {
+      return null;
+    }
+  };
+  return {
+    latest: get("x-acp-latest-version"),
+    minGood: get("x-acp-min-good-version"),
+  };
+}
+
+function staleNoticeText({ current, latest, minGood, updateCmd = "acp-update" }) {
+  if (minGood && compareSemver(current, minGood) < 0) {
+    return `[ACP] governance hook v${current} is below the minimum supported v${minGood} — denies may not be enforced. Run: ${updateCmd}`;
+  }
+  if (latest && compareSemver(current, latest) < 0) {
+    return `[ACP] governance hook v${current} is outdated (v${latest} current). Run: ${updateCmd}`;
+  }
+  return null;
+}
+
+// True at most once per TTL; the marker is written BEFORE returning true.
+// Every failure → false so an unwritable ~/.acp never becomes per-call noise.
+function shouldNoticeNow({ markerPath, now = Date.now(), ttlMs = STALE_NOTICE_TTL_MS }) {
+  try {
+    let last = 0;
+    try {
+      last = Number(readFileSync(markerPath, "utf8").trim()) || 0;
+    } catch { /* no marker yet */ }
+    if (last && now - last < ttlMs) return false;
+    mkdirSync(ACP_DIR, { recursive: true });
+    writeFileSync(markerPath, String(now));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Headers (any hook response) and/or the attest body fields → the notice
+ *  line, already written to stderr, or null. Sync, never throws. */
+function staleHookNotice(res, data) {
+  try {
+    const fromHeaders = readVersionHeaders(res);
+    const latest = fromHeaders.latest
+      ?? (typeof data?.latestVersion === "string" && data.latestVersion.trim() ? data.latestVersion.trim() : null);
+    const minGood = fromHeaders.minGood
+      ?? (typeof data?.minGoodVersion === "string" && data.minGoodVersion.trim() ? data.minGoodVersion.trim() : null);
+    const text = staleNoticeText({ current: PLUGIN_VERSION, latest, minGood, updateCmd: "acp-update" });
+    if (!text) return null;
+    if (!shouldNoticeNow({ markerPath: STALE_NOTICE_MARKER })) return null;
+    process.stderr.write(text + "\n");
+    return text;
+  } catch {
+    return null;
+  }
+}
+
 /* ------------------------------------------------------------------ */
 /* Scoped-token request (Phase 1 cross-arch broker)                    */
 /* ------------------------------------------------------------------ */
@@ -1089,6 +1182,9 @@ async function handlePreToolUse() {
 
   let policyAllowed = true;
   let tierNotice = null;
+  // Stale-hook line (see staleHookNotice): rides the allow funnel below,
+  // and reaches stderr on every decision including denies.
+  let staleNotice = null;
   // The gateway's human-facing line for THIS call (gatewaystack-connect#429):
   // the billing grace nag, or a fail-open — "policy could not be read; this
   // call ran fail-open (not policy-checked)". The field has existed since
@@ -1130,6 +1226,7 @@ async function handlePreToolUse() {
       return;
     }
     const data = await res.json();
+    staleNotice = staleHookNotice(res, data);
     if (data.decision === "deny") {
       denyByPolicy(data.reason || "policy did not return a reason", data.kind);
       return;
@@ -1166,7 +1263,7 @@ async function handlePreToolUse() {
   // session's marker), so the result is memoized for any second read.
   let unpricedNotice;
   function allowSystemMessage() {
-    const parts = [tierNotice, wireWarning].filter((s) => typeof s === "string" && s.trim());
+    const parts = [tierNotice, wireWarning, staleNotice].filter((s) => typeof s === "string" && s.trim());
     if (unpricedNotice === undefined) unpricedNotice = claimUnpricedNotice();
     if (unpricedNotice) parts.push(unpricedNotice);
     return parts.length ? parts.join(" ") : null;
@@ -1401,9 +1498,13 @@ async function handlePostToolUse() {
       flagged: data.action === "redact" || data.action === "block" ? 1 : 0,
       notices: noticed ? 1 : 0,
     });
+    // Stale-hook line: appended to whatever this event already says, never
+    // replacing it; a hook run writes at most ONE stdout JSON object.
+    const staleNotice = staleHookNotice(res, data);
+    const withStale = (msg) => (staleNotice ? `${msg} ${staleNotice}` : msg);
     if (data.action === "redact" || data.action === "block") {
       process.stdout.write(JSON.stringify({
-        systemMessage: `[ACP] ${data.action === "block" ? "Blocked" : "Flagged"}: ${data.reason || "governance policy"}`,
+        systemMessage: withStale(`[ACP] ${data.action === "block" ? "Blocked" : "Flagged"}: ${data.reason || "governance policy"}`),
       }));
     } else if (!SHADOW_OFF && typeof data.notice === "string" && data.notice.trim()) {
       // Shadow-mode counterfactual (gatewaystack-connect#607): the server
@@ -1412,7 +1513,9 @@ async function handlePostToolUse() {
       // advisory only and arrives with action "pass"; frequency caps are
       // server-side. ACP_SHADOW=off is the client-side belt to the server's
       // suspenders (the tenant-level shadowNotices:false disable).
-      process.stdout.write(JSON.stringify({ systemMessage: data.notice }));
+      process.stdout.write(JSON.stringify({ systemMessage: withStale(data.notice) }));
+    } else if (staleNotice) {
+      process.stdout.write(JSON.stringify({ systemMessage: staleNotice }));
     }
   } catch {
     // silent pass-through
@@ -1484,11 +1587,17 @@ async function handleSessionStart() {
     // on. Human channel only — it names a command for the HUMAN to type.
     // The gateway sends it at most once per day per workspace.
     const offer = data && typeof data.offer === "string" && data.offer.trim() ? data.offer.trim() : null;
-    if (data && typeof data.notice === "string" && data.notice.trim()) {
+    // Stale-hook line: headers first, then the attest body's
+    // latestVersion / minGoodVersion. Appended to the upgrade notice when
+    // both are present, never replacing it.
+    const staleNotice = staleHookNotice(res, data);
+    const upgradeNotice = data && typeof data.notice === "string" && data.notice.trim() ? data.notice.trim() : null;
+    const context = [upgradeNotice, staleNotice].filter(Boolean).join("\n");
+    if (context) {
       process.stdout.write(JSON.stringify({
         hookSpecificOutput: {
           hookEventName: "SessionStart",
-          additionalContext: data.notice.trim(),
+          additionalContext: context,
         },
         ...(offer ? { systemMessage: offer } : {}),
       }));
