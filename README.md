@@ -36,6 +36,10 @@ The plugin registers a **PreToolUse hook** that fires before every tool call:
 
 The hook **fails open** on network errors in an interactive session — ACP outages never block Claude Code — but never silently, and never below the floors (see next section).
 
+### Model-call cost from the transcript (v0.18.0+)
+
+Plain `claude` sends model calls straight to Anthropic, so the hook never sees them on the wire — but every hook payload names the session transcript, and the transcript records each model turn's usage (model, input, cache-read, cache-write and output tokens). On each PostToolUse the hook reads the turns that arrived since its last report (a per-transcript byte offset in `~/.acp/transcript-offsets.json`, at most 2 MB read and 50 turns per call) and sends them as `model_usage` on the tool-output call it already makes. The gateway prices them at list rates and labels the rows as hook-reported, API-rate equivalents — what those tokens would cost through the API, never a charge. No launcher, no proxy, no change to how you start Claude Code. A missing, unreadable or malformed transcript reports nothing and never touches the call.
+
 ### Offline floor and local ledger (v0.16.0+)
 
 Whenever the gateway cannot see a call — no key on this machine yet, key present but the gateway unreachable, or `--local` mode — the hook still does two things:
