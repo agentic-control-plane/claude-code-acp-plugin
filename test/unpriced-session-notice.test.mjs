@@ -45,13 +45,20 @@ const GOVERN = join(ROOT, "bin", "govern.mjs");
 const DECIDE = join(ROOT, "bin", "decide.mjs");
 const LOOPBACK = [127, 0, 0, 1].join(".");
 
-const NOTICE_HEAD = "[ACP] Tool calls in this session are checked and logged. Model calls are not: plain `claude` sends them straight to the provider, so they are neither priced nor policy-checked (tool-result redaction, model routing).";
-const WITH_LAUNCHER = `${NOTICE_HEAD} For the cost X-ray and model-call policy, launch with \`claude-acp\` (~/.acp/bin/claude-acp). Shown once per session.`;
-const WITHOUT_LAUNCHER = `${NOTICE_HEAD} For the cost X-ray and model-call policy, install the \`claude-acp\` launcher: curl -sf https://agenticcontrolplane.com/install.sh | bash. Shown once per session.`;
+// Since 0.18.0 a session with a readable transcript is priced from it
+// (transcript-model-usage.test.mjs), so the notice leads with what the
+// session HAS and names only the policy half as missing.
+const NOTICE_HEAD = "[ACP] Tool calls in this session are checked and logged, and model-call cost is estimated from the session transcript (API-rate equivalent, not a metered charge). Model calls are not policy-checked: plain `claude` sends them straight to the provider, so tool-result redaction and model routing are off.";
+const WITH_LAUNCHER = `${NOTICE_HEAD} For those, launch with \`claude-acp\` (~/.acp/bin/claude-acp). Shown once per session.`;
+const WITHOUT_LAUNCHER = `${NOTICE_HEAD} For those, install the \`claude-acp\` launcher: curl -sf https://agenticcontrolplane.com/install.sh | bash. Shown once per session.`;
+// A payload with no transcript (a harness that does not hand one over)
+// prices nothing, and the notice must not claim otherwise.
+const UNCOSTED = "[ACP] Tool calls in this session are checked and logged. Model calls are not: plain `claude` sends them straight to the provider, so they are neither priced nor policy-checked (tool-result redaction, model routing). For the cost X-ray and model-call policy, launch with `claude-acp` (~/.acp/bin/claude-acp). Shown once per session.";
 const WARNING = "[ACP billing] grace period: 3 days left";
 
 let HOME;
 let NOTICES;
+let TRANSCRIPT;
 let server;
 let baseUrl;
 let nextResponse = { decision: "allow" };
@@ -64,6 +71,10 @@ before(async () => {
   writeFileSync(join(HOME, ".acp", "credentials"), "gsk_test_deadbeef\n");
   // The launcher the installer writes; its presence picks the wording.
   writeFileSync(join(HOME, ".acp", "bin", "claude-acp"), "#!/bin/sh\n");
+  // A session transcript as Claude Code keeps one; its presence on the
+  // payload is what makes the session priced.
+  TRANSCRIPT = join(HOME, "transcript.jsonl");
+  writeFileSync(TRANSCRIPT, JSON.stringify({ type: "user", message: { role: "user", content: "hi" } }) + "\n");
   server = createServer((req, res) => {
     let raw = "";
     req.on("data", (c) => { raw += c; });
@@ -88,13 +99,16 @@ beforeEach(() => {
 
 // Explicit env (never spread process.env): a launcher's ACP_KEY, or the
 // runner's own provider base URLs, would silence the notice from outside.
-function preHook(sessionId, { env = {}, tool = "Bash", home = HOME } = {}) {
+function preHook(sessionId, { env = {}, tool = "Bash", home = HOME, transcript = TRANSCRIPT } = {}) {
   const input = {
     hook_event_name: "PreToolUse",
     tool_name: tool,
     tool_input: { command: "ls -la" },
     cwd: "/tmp",
     ...(sessionId === undefined ? {} : { session_id: sessionId }),
+    // Claude Code names the session transcript on every payload; that is
+    // what makes the session priced (0.18.0). Pass null to leave it off.
+    ...(transcript ? { transcript_path: transcript } : {}),
   };
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [GOVERN], {
@@ -189,9 +203,16 @@ test("wire warning + notice on one call → ONE JSON object carrying both", asyn
   assert.equal(again.systemMessage, WARNING);
 });
 
+test("no transcript on the payload: nothing is priced, and the notice says so (never claims an estimate it cannot make)", async () => {
+  const out = await preHook("sess-uncosted-1", { transcript: null });
+  assert.equal(out?.systemMessage, UNCOSTED);
+  const missing = await preHook("sess-uncosted-2", { transcript: join(HOME, "no-such-transcript.jsonl") });
+  assert.equal(missing?.systemMessage, UNCOSTED);
+});
+
 test("codex names codex-acp (both client spellings); cursor has no launcher and gets nothing", async () => {
-  const codex = await preHook("sess-codex-1", { env: { ACP_CLIENT: "codex", ACP_HARNESS: "codex" } });
-  assert.match(codex?.systemMessage ?? "", /plain `codex` .* install the `codex-acp` launcher/);
+  const codex = await preHook("sess-codex-1", { env: { ACP_CLIENT: "codex", ACP_HARNESS: "codex" }, transcript: null });
+  assert.match(codex?.systemMessage ?? "", /plain `codex` .*neither priced nor policy-checked.* install the `codex-acp` launcher/);
   const plugin = await preHook("sess-codex-2", { env: { ACP_CLIENT: "codex-plugin", ACP_HARNESS: "codex" } });
   assert.match(plugin?.systemMessage ?? "", /`codex-acp`/);
   assert.equal(await preHook("sess-cursor-1", { env: { ACP_CLIENT: "cursor" } }), null);

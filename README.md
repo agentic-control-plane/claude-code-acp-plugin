@@ -42,13 +42,13 @@ Plain `claude` sends model calls straight to Anthropic, so the hook never sees t
 
 ### Plain-launch notice (v0.19.0+)
 
-This hook sees every tool call whether you start `claude` or `claude-acp`. It never sees a model call: only `claude-acp` (`~/.acp/bin/claude-acp`, written by the installer) routes model traffic through the ACP proxy, which is where the cost X-ray and model-call policy (tool-result redaction, model routing) run. Under plain `claude`, the first allowed call of each session says so, once:
+This hook sees every tool call whether you start `claude` or `claude-acp`, and since 0.18.0 it prices model calls from the transcript either way. What it cannot do under plain `claude` is policy-check the model calls themselves: only `claude-acp` (`~/.acp/bin/claude-acp`, written by the installer) routes them through the ACP proxy, where tool-result redaction and model routing run and where cost is metered rather than estimated. Under plain `claude`, the first allowed call of each session says so, once:
 
 ```
-[ACP] Tool calls in this session are checked and logged. Model calls are not: plain `claude` sends them straight to the provider, so they are neither priced nor policy-checked (tool-result redaction, model routing). For the cost X-ray and model-call policy, launch with `claude-acp` (~/.acp/bin/claude-acp). Shown once per session.
+[ACP] Tool calls in this session are checked and logged, and model-call cost is estimated from the session transcript (API-rate equivalent, not a metered charge). Model calls are not policy-checked: plain `claude` sends them straight to the provider, so tool-result redaction and model routing are off. For those, launch with `claude-acp` (~/.acp/bin/claude-acp). Shown once per session.
 ```
 
-Nothing else changes: the notice rides an allow, never a deny or an ask, and a session started by the launcher (which exports `ACP_KEY`) or with `ANTHROPIC_BASE_URL` already at the ACP proxy never sees it. Local mode never shows it. Once per session is enforced with a marker under `~/.acp/session-notices/` (pruned after 7 days, capped at 200).
+A harness whose hook payload carries no transcript (so nothing is priced) gets the plainer form: "…neither priced nor policy-checked… For the cost X-ray and model-call policy, launch with…". Nothing else changes: the notice rides an allow, never a deny or an ask, and a session started by the launcher (which exports `ACP_KEY`) or with `ANTHROPIC_BASE_URL` already at the ACP proxy never sees it. Local mode never shows it. Once per session is enforced with a marker under `~/.acp/session-notices/` (pruned after 7 days, capped at 200).
 
 ### Offline floor and local ledger (v0.16.0+)
 

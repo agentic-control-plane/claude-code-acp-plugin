@@ -310,6 +310,15 @@ function claimUnpricedNotice() {
     const how = existsSync(join(homedir(), ".acp", "bin", launcher))
       ? `launch with \`${launcher}\` (~/.acp/bin/${launcher})`
       : `install the \`${launcher}\` launcher: curl -sf https://agenticcontrolplane.com/install.sh | bash`;
+    // Since 0.18.0 a session whose payload names a readable transcript IS
+    // priced — from the transcript, at API-rate equivalents (see
+    // collectTranscriptUsage). Say what they have, then what still needs
+    // the launcher: the policy half. A harness whose payload carries no
+    // transcript gets nothing priced, and the notice says so.
+    const costed = typeof input?.transcript_path === "string" && input.transcript_path && existsSync(input.transcript_path);
+    if (costed) {
+      return `[ACP] Tool calls in this session are checked and logged, and model-call cost is estimated from the session transcript (API-rate equivalent, not a metered charge). Model calls are not policy-checked: plain \`${bin}\` sends them straight to the provider, so tool-result redaction and model routing are off. For those, ${how}. Shown once per session.`;
+    }
     return `[ACP] Tool calls in this session are checked and logged. Model calls are not: plain \`${bin}\` sends them straight to the provider, so they are neither priced nor policy-checked (tool-result redaction, model routing). For the cost X-ray and model-call policy, ${how}. Shown once per session.`;
   } catch { return null; }
 }
