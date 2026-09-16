@@ -40,6 +40,16 @@ The hook **fails open** on network errors in an interactive session — ACP outa
 
 Plain `claude` sends model calls straight to Anthropic, so the hook never sees them on the wire — but every hook payload names the session transcript, and the transcript records each model turn's usage (model, input, cache-read, cache-write and output tokens). On each PostToolUse the hook reads the turns that arrived since its last report (a per-transcript byte offset in `~/.acp/transcript-offsets.json`, at most 2 MB read and 50 turns per call) and sends them as `model_usage` on the tool-output call it already makes. The gateway prices them at list rates and labels the rows as hook-reported, API-rate equivalents — what those tokens would cost through the API, never a charge. No launcher, no proxy, no change to how you start Claude Code. A missing, unreadable or malformed transcript reports nothing and never touches the call.
 
+### Plain-launch notice (v0.19.0+)
+
+This hook sees every tool call whether you start `claude` or `claude-acp`, and since 0.18.0 it prices model calls from the transcript either way. What it cannot do under plain `claude` is policy-check the model calls themselves: only `claude-acp` (`~/.acp/bin/claude-acp`, written by the installer) routes them through the ACP proxy, where tool-result redaction and model routing run and where cost is metered rather than estimated. Under plain `claude`, the first allowed call of each session says so, once:
+
+```
+[ACP] Tool calls in this session are checked and logged, and model-call cost is estimated from the session transcript (API-rate equivalent, not a metered charge). Model calls are not policy-checked: plain `claude` sends them straight to the provider, so tool-result redaction and model routing are off. For those, launch with `claude-acp` (~/.acp/bin/claude-acp). Shown once per session.
+```
+
+A harness whose hook payload carries no transcript (so nothing is priced) gets the plainer form: "…neither priced nor policy-checked… For the cost X-ray and model-call policy, launch with…". Nothing else changes: the notice rides an allow, never a deny or an ask, and a session started by the launcher (which exports `ACP_KEY`) or with `ANTHROPIC_BASE_URL` already at the ACP proxy never sees it. Local mode never shows it. Once per session is enforced with a marker under `~/.acp/session-notices/` (pruned after 7 days, capped at 200).
+
 ### Offline floor and local ledger (v0.16.0+)
 
 Whenever the gateway cannot see a call — no key on this machine yet, key present but the gateway unreachable, or `--local` mode — the hook still does two things:

@@ -67,7 +67,7 @@ const ACP_GOVERN =
   process.env.ACP_API_BASE ||
   "https://govern.agenticcontrolplane.com";
 
-const PLUGIN_VERSION = "0.18.0";
+const PLUGIN_VERSION = "0.19.0";
 
 // Console base for user-facing deep links (session receipt, #606).
 const ACP_CONSOLE =
@@ -240,6 +240,87 @@ function detectVendor(toolName, toolInput) {
     if (p.regex.test(cmd)) return p;
   }
   return null;
+}
+
+// Unpriced-session notice (cloud mode only). This hook runs under the plain
+// harness binary too, where it sees tool calls but never model calls: only
+// the <harness>-acp launchers route model traffic through the proxy, which
+// is where pricing and model-call policy (tool-result redaction, denied
+// tools stripped from the request, model routing) run. Production
+// 2026-09-16: 0 of 69 external tenants had ever launched via a launcher,
+// and nothing told them — the only surface that mentions cost is the
+// launcher's own exit line. So the hook says it, once per session, on an
+// allowed call. Detection: every launcher is generated from ONE template
+// whose first act is `export ACP_KEY` (install.sh acp_write_launcher);
+// the hook inherits the launcher's environment, so no ACP_KEY means this
+// session was not started by a launcher. Clients without a launcher
+// (Cursor) get nothing. Purely additive: never blocks, never changes a
+// decision, never throws — any failure here means silence, not a nag.
+// Same logic as the installer's bundled engine (agenticcontrolplane.com
+// install.sh) — keep the two in step.
+const LAUNCHER_BY_CLIENT = {
+  "claude-code-plugin": ["claude", "claude-acp"],
+  codex: ["codex", "codex-acp"],
+  "codex-plugin": ["codex", "codex-acp"],
+  "qwen-code": ["qwen", "qwen-acp"],
+  opencode: ["opencode", "opencode-acp"],
+  pi: ["pi", "pi-acp"],
+  hermes: ["hermes", "hermes-acp"],
+  "prime-agent": ["prime-agent", "prime-acp"],
+  "grok-build": ["grok", "grok-acp"],
+  dsh: ["dsh", "dsh-acp"],
+};
+const NOTICE_DIR = join(homedir(), ".acp", "session-notices");
+const NOTICE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const NOTICE_MAX_FILES = 200;
+function launchedViaLauncher() {
+  if (process.env.ACP_KEY) return true;
+  // Hand-rolled proxy env (ANTHROPIC_BASE_URL / OPENAI_BASE_URL at the ACP
+  // proxy) is priced too; do not tell those users to switch.
+  return /agenticcontrolplane\.com/.test(`${process.env.ANTHROPIC_BASE_URL || ""} ${process.env.OPENAI_BASE_URL || ""}`);
+}
+// Returns the notice text the FIRST time it is called for this session, null
+// every time after — including from a parallel hook process for the same
+// session: the marker is created with an exclusive flag, so exactly one
+// caller wins. No session id → no marker → no notice (bias to silence).
+function claimUnpricedNotice() {
+  try {
+    if (launchedViaLauncher()) return null;
+    const pair = LAUNCHER_BY_CLIENT[ACP_CLIENT];
+    if (!pair) return null;
+    const id = String(input?.session_id ?? "").replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 120);
+    if (!id) return null;
+    mkdirSync(NOTICE_DIR, { recursive: true });
+    try { writeFileSync(join(NOTICE_DIR, `unpriced-${id}`), new Date().toISOString(), { flag: "wx" }); }
+    catch { return null; }
+    // Prune so the directory cannot grow without bound: drop markers past
+    // the TTL, and never keep more than NOTICE_MAX_FILES (newest win).
+    try {
+      const cutoff = Date.now() - NOTICE_TTL_MS;
+      const files = readdirSync(NOTICE_DIR).map((n) => {
+        const f = join(NOTICE_DIR, n); let m = 0;
+        try { m = statSync(f).mtimeMs; } catch { /* vanished */ }
+        return { f, m };
+      }).sort((a, b) => b.m - a.m);
+      files.forEach((x, i) => { if (x.m < cutoff || i >= NOTICE_MAX_FILES) { try { unlinkSync(x.f); } catch { /* raced */ } } });
+    } catch { /* pruning is opportunistic */ }
+    const [bin, launcher] = pair;
+    // A marketplace-only install (`claude plugin install`) has this hook but
+    // no launcher yet: point at the installer, not at a path that is absent.
+    const how = existsSync(join(homedir(), ".acp", "bin", launcher))
+      ? `launch with \`${launcher}\` (~/.acp/bin/${launcher})`
+      : `install the \`${launcher}\` launcher: curl -sf https://agenticcontrolplane.com/install.sh | bash`;
+    // Since 0.18.0 a session whose payload names a readable transcript IS
+    // priced — from the transcript, at API-rate equivalents (see
+    // collectTranscriptUsage). Say what they have, then what still needs
+    // the launcher: the policy half. A harness whose payload carries no
+    // transcript gets nothing priced, and the notice says so.
+    const costed = typeof input?.transcript_path === "string" && input.transcript_path && existsSync(input.transcript_path);
+    if (costed) {
+      return `[ACP] Tool calls in this session are checked and logged, and model-call cost is estimated from the session transcript (API-rate equivalent, not a metered charge). Model calls are not policy-checked: plain \`${bin}\` sends them straight to the provider, so tool-result redaction and model routing are off. For those, ${how}. Shown once per session.`;
+    }
+    return `[ACP] Tool calls in this session are checked and logged. Model calls are not: plain \`${bin}\` sends them straight to the provider, so they are neither priced nor policy-checked (tool-result redaction, model routing). For the cost X-ray and model-call policy, ${how}. Shown once per session.`;
+  } catch { return null; }
 }
 
 function readToken() {
@@ -1072,11 +1153,16 @@ async function handlePreToolUse() {
   }
 
   // A hook run may write exactly ONE stdout JSON object — every allow-path
-  // exit funnels through here so the tier-divergence notice and the wire
-  // warning never produce a second one. Both may fire on one call; they
-  // share the single systemMessage.
+  // exit funnels through here so the tier-divergence notice, the wire
+  // warning and the unpriced-session notice never produce a second one.
+  // All may fire on one call; they share the single systemMessage. The
+  // unpriced claim is made at most once per process (it consumes the
+  // session's marker), so the result is memoized for any second read.
+  let unpricedNotice;
   function allowSystemMessage() {
     const parts = [tierNotice, wireWarning].filter((s) => typeof s === "string" && s.trim());
+    if (unpricedNotice === undefined) unpricedNotice = claimUnpricedNotice();
+    if (unpricedNotice) parts.push(unpricedNotice);
     return parts.length ? parts.join(" ") : null;
   }
   function exitAllow() {
@@ -1156,13 +1242,14 @@ async function handlePreToolUse() {
     }
     envParts.push(`${vendor.envVar}=${tokenResult.token}`);
     const updated = `${envParts.join(" ")} ${original}`;
+    const msg = allowSystemMessage();
     process.stdout.write(JSON.stringify({
       hookSpecificOutput: {
         hookEventName: "PreToolUse",
         permissionDecision: "allow",
         updatedInput: { ...input.tool_input, command: updated },
       },
-      ...(allowSystemMessage() ? { systemMessage: allowSystemMessage() } : {}),
+      ...(msg ? { systemMessage: msg } : {}),
     }));
     process.exit(0);
   }
