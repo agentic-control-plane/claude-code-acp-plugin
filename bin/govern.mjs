@@ -43,7 +43,7 @@
 // always fails open on token-request errors and surfaces a stderr warning;
 // future versions will respect the server's `scopedTokensFailMode` policy.
 
-import { readFileSync, appendFileSync, existsSync, mkdirSync, writeFileSync, unlinkSync, readdirSync, statSync } from "fs";
+import { readFileSync, appendFileSync, existsSync, mkdirSync, writeFileSync, unlinkSync, readdirSync, statSync, openSync, readSync, closeSync } from "fs";
 import { homedir } from "os";
 import { join, isAbsolute } from "path";
 import { createHash } from "crypto";
@@ -1253,6 +1253,90 @@ async function handlePreToolUse() {
 /* PostToolUse                                                         */
 /* ------------------------------------------------------------------ */
 
+// Cost from the hook, no proxy required (gatewaystack-connect#932). The
+// harness transcript (Claude Code's session JSONL, handed to us as
+// transcript_path on every hook payload) records every model turn's usage:
+// model, input, cache-read, cache-write and output tokens. Read only what
+// arrived since the last report — a per-transcript byte offset in
+// ~/.acp/transcript-offsets.json — and ship the turns as `model_usage` on
+// the tool-output call we already make. The gateway prices them at list
+// rates and labels the rows API-rate equivalents (hook-reported, not a
+// charge). The gateway side has been live since 2026-09-02; the collector
+// shipped only in the installer's offline fallback engine, which no online
+// install runs — so no real client ever sent the field. This is the port.
+//
+// Bounded: at most 2 MB read and 50 turns sent per call. Fail-open in
+// every branch: a missing, unreadable, truncated or malformed transcript
+// returns undefined (the field is simply absent — never an empty array,
+// never a throw) and can never touch the decision or delay the call.
+// The offset advances past what is being sent before the request goes
+// out, so a turn is normally reported once; the gateway's (session, id)
+// dedupe absorbs retries. A partial trailing line is left for next time.
+const TRANSCRIPT_OFFSETS = join(ACP_DIR, "transcript-offsets.json");
+const TRANSCRIPT_READ_CAP = 2 * 1024 * 1024;
+const TRANSCRIPT_MAX_TURNS = 50;
+const TRANSCRIPT_OFFSETS_KEEP = 40;
+function collectTranscriptUsage(path) {
+  try {
+    if (typeof path !== "string" || !path || !existsSync(path)) return undefined;
+    let offsets = {};
+    try { offsets = JSON.parse(readFileSync(TRANSCRIPT_OFFSETS, "utf8")) || {}; } catch { offsets = {}; }
+    if (!offsets || typeof offsets !== "object" || Array.isArray(offsets)) offsets = {};
+    let size = 0;
+    try { size = statSync(path).size; } catch { return undefined; }
+    let start = typeof offsets[path] === "number" && offsets[path] >= 0 && offsets[path] <= size ? offsets[path] : 0;
+    if (size - start > TRANSCRIPT_READ_CAP) start = size - TRANSCRIPT_READ_CAP;
+    if (size <= start) return undefined;
+    let chunk = "";
+    try {
+      const fd = openSync(path, "r");
+      try {
+        const buf = Buffer.alloc(size - start);
+        const n = readSync(fd, buf, 0, buf.length, start);
+        chunk = buf.subarray(0, n).toString("utf8");
+      } finally { closeSync(fd); }
+    } catch { return undefined; }
+    // Only consume complete lines; a partial trailing line waits for next time.
+    const lastNl = chunk.lastIndexOf("\n");
+    if (lastNl < 0) return undefined;
+    const consumed = Buffer.byteLength(chunk.slice(0, lastNl + 1), "utf8");
+    const turns = [];
+    for (const line of chunk.slice(0, lastNl).split("\n")) {
+      if (!line || line.indexOf('"usage"') < 0) continue;
+      let e; try { e = JSON.parse(line); } catch { continue; }
+      const m = e && e.message;
+      const u = m && m.usage;
+      if (!u || typeof u !== "object" || (e.type !== "assistant" && m.role !== "assistant")) continue;
+      const id = (typeof m.id === "string" && m.id) || (typeof e.requestId === "string" && e.requestId) || (typeof e.uuid === "string" && e.uuid);
+      if (!id || typeof m.model !== "string" || !m.model) continue;
+      turns.push({
+        id, model: m.model,
+        input_tokens: u.input_tokens || 0,
+        cache_read_input_tokens: u.cache_read_input_tokens || 0,
+        cache_creation_input_tokens: u.cache_creation_input_tokens || 0,
+        output_tokens: u.output_tokens || 0,
+        ts: typeof e.timestamp === "string" ? e.timestamp : undefined,
+      });
+    }
+    // Advance the offset only past what we are sending; keep the file small
+    // (transcripts that no longer exist are dropped, at most
+    // TRANSCRIPT_OFFSETS_KEEP others are kept).
+    try {
+      const keep = {};
+      let n = 0;
+      for (const [k, v] of Object.entries(offsets)) { if (k !== path && existsSync(k) && n++ < TRANSCRIPT_OFFSETS_KEEP) keep[k] = v; }
+      keep[path] = start + consumed;
+      mkdirSync(ACP_DIR, { recursive: true });
+      writeFileSync(TRANSCRIPT_OFFSETS, JSON.stringify(keep));
+    } catch { /* best-effort — at worst a window is reported twice, and the gateway dedupes */ }
+    // Same-id turns can repeat across streamed chunks; keep the last (fullest).
+    const byId = new Map();
+    for (const t of turns) byId.set(t.id, t);
+    const out = Array.from(byId.values()).slice(-TRANSCRIPT_MAX_TURNS);
+    return out.length ? out : undefined;
+  } catch { return undefined; }
+}
+
 async function handlePostToolUse() {
   let outputStr = "";
   try {
@@ -1268,6 +1352,10 @@ async function handlePostToolUse() {
   // Lapses queued by a fail-open PreToolUse in this session (#902) ride
   // along; the marker is cleared only after the gateway acknowledged.
   const preLapse = readPendingLapse(input.session_id);
+  // Model turns since the last report (see collectTranscriptUsage). An
+  // undefined value is dropped by JSON.stringify: the field is absent, not
+  // an empty array, whenever there is nothing to report.
+  const modelUsage = collectTranscriptUsage(input.transcript_path);
   const body = JSON.stringify({
     tool_name: input.tool_name,
     tool_input: input.tool_input,
@@ -1279,6 +1367,7 @@ async function handlePostToolUse() {
     agent_tier: resolveAgentTier(),
     tier_signals: tierSignals(),
     ...(preLapse ? { pre_lapse: preLapse } : {}),
+    ...(modelUsage ? { model_usage: modelUsage } : {}),
   });
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 4000);
