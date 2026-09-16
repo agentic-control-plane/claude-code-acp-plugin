@@ -68,8 +68,11 @@ function preHook(sessionId, env = {}) {
     cwd: "/tmp",
   };
   return new Promise((resolve, reject) => {
+    // ACP_KEY: a session started by claude-acp. Keeps the once-per-session
+    // unpriced-session notice (unpriced-session-notice.test.mjs) out of
+    // these assertions, which are about the wire warning alone.
     const child = spawn(process.execPath, [GOVERN], {
-      env: { HOME, PATH: process.env.PATH, ACP_GOVERN_BASE: baseUrl, ...env },
+      env: { HOME, PATH: process.env.PATH, ACP_GOVERN_BASE: baseUrl, ACP_KEY: "gsk_test_deadbeef", ...env },
       stdio: ["pipe", "pipe", "pipe"],
     });
     let stdout = "";

@@ -36,6 +36,16 @@ The plugin registers a **PreToolUse hook** that fires before every tool call:
 
 The hook **fails open** on network errors in an interactive session — ACP outages never block Claude Code — but never silently, and never below the floors (see next section).
 
+### Plain-launch notice (v0.19.0+)
+
+This hook sees every tool call whether you start `claude` or `claude-acp`. It never sees a model call: only `claude-acp` (`~/.acp/bin/claude-acp`, written by the installer) routes model traffic through the ACP proxy, which is where the cost X-ray and model-call policy (tool-result redaction, model routing) run. Under plain `claude`, the first allowed call of each session says so, once:
+
+```
+[ACP] Tool calls in this session are checked and logged. Model calls are not: plain `claude` sends them straight to the provider, so they are neither priced nor policy-checked (tool-result redaction, model routing). For the cost X-ray and model-call policy, launch with `claude-acp` (~/.acp/bin/claude-acp). Shown once per session.
+```
+
+Nothing else changes: the notice rides an allow, never a deny or an ask, and a session started by the launcher (which exports `ACP_KEY`) or with `ANTHROPIC_BASE_URL` already at the ACP proxy never sees it. Local mode never shows it. Once per session is enforced with a marker under `~/.acp/session-notices/` (pruned after 7 days, capped at 200).
+
 ### Offline floor and local ledger (v0.16.0+)
 
 Whenever the gateway cannot see a call — no key on this machine yet, key present but the gateway unreachable, or `--local` mode — the hook still does two things:
