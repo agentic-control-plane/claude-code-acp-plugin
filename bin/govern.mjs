@@ -67,7 +67,7 @@ const ACP_GOVERN =
   process.env.ACP_API_BASE ||
   "https://govern.agenticcontrolplane.com";
 
-const PLUGIN_VERSION = "0.20.0";
+const PLUGIN_VERSION = "0.21.0";
 
 // Console base for user-facing deep links (session receipt, #606).
 const ACP_CONSOLE =
