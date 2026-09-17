@@ -674,12 +674,92 @@ export function destructiveFloor(toolName, toolInput, context) {
   }
   for (const t of texts) {
     const stripped = stripDataHeredocs(t);
-    // Quoted spans with whitespace are prose, not commands.
-    const masked = stripped.replace(/'[^']*\s[^']*'/g, "''").replace(/"[^"]*\s[^"]*"/g, '""');
+    const masked = maskQuotedProse(stripped);
     if (FORCE_PUSH_RE.test(masked)) return "force-pushes over shared git history";
     if (PIPE_TO_SHELL_RE.test(masked) || SHELL_OF_DOWNLOAD_RE.test(t)) return "pipes a remote download into a shell";
     const rm = recursiveDeleteOutsideCwd(stripped, context && context.cwd);
     if (rm) return rm;
+  }
+  return null;
+}
+
+/** Blank quoted spans that contain whitespace — prose, not commands — in
+ *  one left-to-right scan that pairs quotes the way the shell does. The
+ *  global-regex version paired a CLOSING quote with the next opening one:
+ *  in `A="x"; rm -rf "/"` it masked `; rm -rf ` as prose and the command
+ *  between two short quoted arguments vanished from the floor's view
+ *  (gatewaystack-connect#1229). */
+export function maskQuotedProse(s) {
+  let out = "";
+  for (let i = 0; i < s.length; ) {
+    const ch = s[i];
+    if (ch !== "'" && ch !== '"') { out += ch; i++; continue; }
+    let j = i + 1;
+    while (j < s.length && !(s[j] === ch && s[j - 1] !== "\\")) j++;
+    const inner = s.slice(i + 1, j);
+    if (j >= s.length) { out += ch + inner; break; }
+    out += /\s/.test(inner) ? ch + ch : ch + inner + ch;
+    i = j + 1;
+  }
+  return out;
+}
+
+// ── Uninstall floor (ask-level; gatewaystack-connect#1229) ─────────────
+// Easy for the human, not for the agent. A human typing `acp-uninstall` in
+// a terminal never passes through this hook. An AGENT removing ACP asks —
+// and the OFFLINE floor is the one that matters most here: an outage, or
+// deleting the key first, must not be the uninstall path. Three shapes:
+//   (a) the sanctioned uninstaller: `acp-uninstall` / `acp-uninstall.cmd`
+//       in command position, or a shell/pwsh running the cached copy;
+//   (b) fetching the hosted uninstaller (curl/wget/irm/iwr/Invoke-*);
+//   (c) a recursive delete aimed at `.acp`, or at a VARIABLE in a payload
+//       that also names `.acp` — the 2026-09-17 removal bound the path two
+//       statements earlier (`$acp = Join-Path $env:USERPROFILE '.acp'`)
+//       and deleted `$acp`; no per-segment verb+path rule can see that.
+// Same fixtures as the gateway's floor, so an offline call and a governed
+// call agree.
+
+const UNINSTALL_CMD_RE = /(?:^|[;&|]\s*|\$\(\s*)(?:(?:sudo|doas|env|nice|nohup|setsid|stdbuf|timeout|time|command|builtin)\s+(?:-\S+\s+)*)*(?:\S*[/\\])?acp-uninstall(?:\.cmd)?(?=\s|$|[;&|)])/m;
+const UNINSTALL_SCRIPT_RE = /(?:^|[;&|]\s*|\$\(\s*)(?:(?:ba|z|da|k)?sh|pwsh|powershell)(?:\.exe)?\b[^\n;|&]*[/\\]\.acp[/\\]uninstall\.(?:sh|ps1)\b/im;
+const UNINSTALL_FETCH_RE = /\b(?:curl|wget|irm|iwr|Invoke-WebRequest|Invoke-RestMethod)\b[^\n]*?agenticcontrolplane\.com\/uninstall\.(?:sh|ps1)\b/i;
+const RECURSIVE_DELETE_RE = /\b(?:remove-item|ri|rm|del|erase|rd|rmdir)\b([^\n;|&]*)/gi;
+const RECURSE_FLAG_RE = /\s-(?!force\b)(?:recurse|[a-z]{0,3}r[a-z]{0,3})(?=\s|$)/i;
+const VAR_OPERAND_RE = /(?:^|\s|\(|["'])\$(?:\{|env:|[A-Za-z_])/;
+const ACP_DIR_MENTION_RE = /(?:^|[\s\\/'"(=])\.acp(?=[\\/'"\s)]|$)/m;
+const PS_SHAPE_RE = /\$env:[A-Za-z_]\w*|\[[A-Za-z][\w.]*\]::|\s-ErrorAction\b|\b(?:Join-Path|Remove-Item|Write-Host|Test-Path|Get-ChildItem|Get-Content|Set-Content|Out-File|New-Item|Copy-Item|Move-Item|Invoke-WebRequest|Invoke-RestMethod|Invoke-Expression|Start-Process)\b/i;
+// PowerShell's `-Command`/`-c` string is a launder the same way `sh -c` is.
+const PWSH_COMMAND_RE = /\b(?:powershell|pwsh)(?:\.exe)?\b[^'"\n;|&]*?\s-(?:c|command)\s+(['"])([\s\S]*?)\1/gi;
+
+/** Ask-level floor for an agent-initiated ACP removal: the label, or null. */
+export function uninstallFloor(toolName, toolInput) {
+  const name = String(toolName || "");
+  if (name !== "Bash" && name !== "run_terminal_cmd" && name !== "shell") return null;
+  const input = typeof toolInput === "string" ? safeParse(toolInput) : (toolInput || {});
+  const cmd = String(input.command || input.cmd || "");
+  if (!cmd) return null;
+  const texts = [cmd];
+  for (const seg of splitSegments(cmd)) {
+    const { bin, args } = parseCommand(seg);
+    const inner = innerShellCommand(bin, args);
+    if (inner) texts.push(inner);
+  }
+  let m;
+  PWSH_COMMAND_RE.lastIndex = 0;
+  while ((m = PWSH_COMMAND_RE.exec(cmd)) !== null) texts.push(m[2]);
+  const pwsh = PS_SHAPE_RE.test(maskQuotedProse(cmd));
+  for (const t of texts) {
+    const masked = maskQuotedProse(stripDataHeredocs(t));
+    if (UNINSTALL_CMD_RE.test(masked) || UNINSTALL_SCRIPT_RE.test(masked)) return "runs the ACP uninstaller";
+    if (UNINSTALL_FETCH_RE.test(masked)) return "fetches the ACP uninstaller";
+    const mentionsAcp = ACP_DIR_MENTION_RE.test(masked);
+    RECURSIVE_DELETE_RE.lastIndex = 0;
+    while ((m = RECURSIVE_DELETE_RE.exec(masked)) !== null) {
+      const args = m[1] || "";
+      if (!RECURSE_FLAG_RE.test(args)) continue;
+      if (ACP_DIR_MENTION_RE.test(args) || (mentionsAcp && VAR_OPERAND_RE.test(args))) {
+        return `removes the ACP directory (${pwsh ? "PowerShell" : "shell"})`;
+      }
+    }
   }
   return null;
 }
@@ -734,6 +814,16 @@ export function decide(toolName, toolInput, policy, context) {
         return { decision: def, reason: `local policy: default → ${def}`, source: "default", classified: key, contextGuard: shadow };
       })();
 
+  // Uninstall floor (gatewaystack-connect#1229): an agent removing ACP
+  // asks, in every mode — a policy allow cannot loosen it. Checked before
+  // the destructive floor so the human reads what is actually happening
+  // ("removes ACP") rather than the generic shape ("pipes a download").
+  if (result.decision === "allow") {
+    const exit = uninstallFloor(toolName, toolInput);
+    if (exit) {
+      return { decision: "ask", reason: `uninstall floor: ${exit}`, source: "uninstall-floor", classified: key, contextGuard: shadow, floor: exit };
+    }
+  }
   // Destructive floor (#1097): tightens an allow to ask in every mode. A
   // policy deny or ask already stands; a policy allow cannot loosen it.
   if (result.decision === "allow") {

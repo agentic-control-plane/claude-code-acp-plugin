@@ -462,7 +462,10 @@ async function loadEngine() {
   for (const spec of [pathToFileURL(join(ACP_DIR, "decide.mjs")).href, "./decide.mjs"]) {
     try {
       const m = await import(spec);
-      if (typeof m.decide === "function" && typeof m.hardlineFloor === "function" && typeof m.destructiveFloor === "function") return m;
+      // uninstallFloor (gatewaystack-connect#1229) is required too: an
+      // installed copy that predates it is skipped for the bundled one,
+      // so the exit is governed offline before the installer catches up.
+      if (typeof m.decide === "function" && typeof m.hardlineFloor === "function" && typeof m.destructiveFloor === "function" && typeof m.uninstallFloor === "function") return m;
     } catch { /* try the next */ }
   }
   return null;
@@ -514,6 +517,35 @@ function applyOfflineFloors(input, mode) {
       hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: reason },
       systemMessage: reason,
     }));
+    return true;
+  }
+  // Uninstall floor (#1229) — checked before the destructive floor, same
+  // order as decide(), and the reason names what is actually happening
+  // ("removes ACP") instead of the generic shape. This is the branch the
+  // whole floor exists for: an outage or a deleted key is exactly when an
+  // agent-initiated uninstall must still ask, not slide through on
+  // "nothing to check against."
+  const exit = ENGINE.uninstallFloor(input.tool_name, input.tool_input);
+  if (exit) {
+    ledgerRecord(input, { decision: "ask", source: "uninstall-floor", reason: exit, mode });
+    const why = mode === "no-key"
+      ? "ACP has no key on this machine, so nobody can approve it remotely"
+      : "the gateway could not be reached, so nobody can approve it remotely";
+    if (HARNESS === "codex") {
+      const reason = `[ACP] Uninstall floor (${exit}) — ${why}. Codex cannot ask mid-run, so the call is blocked; a human runs it, or run \`acp-uninstall\` yourself in a terminal.`;
+      process.stdout.write(JSON.stringify({
+        hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: reason },
+        systemMessage: reason,
+      }));
+    } else {
+      process.stdout.write(JSON.stringify({
+        hookSpecificOutput: {
+          hookEventName: "PreToolUse",
+          permissionDecision: "ask",
+          permissionDecisionReason: `[ACP] Uninstall floor: ${exit} — ${why}. An agent is trying to remove ACP from this machine. If that's you, approve — or run \`acp-uninstall\` yourself in a terminal.`,
+        },
+      }));
+    }
     return true;
   }
   const soft = ENGINE.destructiveFloor(input.tool_name, input.tool_input, { cwd: input.cwd });
