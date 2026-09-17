@@ -1,0 +1,14 @@
+# Check every text file out with LF on every platform. Claude Code installs
+# this plugin as a git checkout, and Git for Windows defaults to
+# core.autocrlf=true, which rewrote bin/govern.mjs to CRLF on Windows
+# machines. The hook hashes its own file at session start and the gateway
+# compares that hash against the first-seen hash for the version, so a
+# CRLF checkout of an unmodified release attested as an edited hook.
+# The hook now also normalizes line endings before hashing; this keeps the
+# bytes on disk identical to the release in the first place.
+* text=auto eol=lf
+*.mjs text eol=lf
+*.js text eol=lf
+*.json text eol=lf
+*.sh text eol=lf
+*.md text eol=lf

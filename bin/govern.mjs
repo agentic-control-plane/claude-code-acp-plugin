@@ -67,7 +67,7 @@ const ACP_GOVERN =
   process.env.ACP_API_BASE ||
   "https://govern.agenticcontrolplane.com";
 
-const PLUGIN_VERSION = "0.21.0";
+const PLUGIN_VERSION = "0.22.0";
 
 // Console base for user-facing deep links (session receipt, #606).
 const ACP_CONSOLE =
@@ -1534,9 +1534,22 @@ async function handlePostToolUse() {
 // fail-open in every branch: attestation is observability, and it must
 // never delay or block a session — an absent attestation is itself the
 // signal (the console shows the session as "unattested").
+//
+// Line endings are normalized (CRLF → LF) before hashing. Marketplace
+// installs are git checkouts, and Git for Windows defaults to
+// core.autocrlf=true, which rewrites this file to CRLF on checkout: the
+// same unmodified release hashed differently per machine, and every
+// default-settings Windows install attested as an "edited hook"
+// (hash_mismatch) unless it happened to be the first machine seen for
+// that version. Normalizing makes the hash a property of the release,
+// not of the checkout. Byte-transparent (latin1 round trip) so an LF
+// file hashes exactly as before. Mirrored in lib/attestation.mjs
+// (normalizeEol) where the tests pin it.
 function sha256FileHex(path) {
   try {
-    return createHash("sha256").update(readFileSync(path)).digest("hex");
+    let buf = readFileSync(path);
+    if (buf.includes(13)) buf = Buffer.from(buf.toString("latin1").replace(/\r\n/g, "\n"), "latin1");
+    return createHash("sha256").update(buf).digest("hex");
   } catch {
     return null;
   }
