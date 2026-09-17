@@ -67,7 +67,7 @@ const ACP_GOVERN =
   process.env.ACP_API_BASE ||
   "https://govern.agenticcontrolplane.com";
 
-const PLUGIN_VERSION = "0.22.0";
+const PLUGIN_VERSION = "0.23.0";
 
 // Console base for user-facing deep links (session receipt, #606).
 const ACP_CONSOLE =
@@ -273,6 +273,14 @@ const LAUNCHER_BY_CLIENT = {
 const NOTICE_DIR = join(homedir(), ".acp", "session-notices");
 const NOTICE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const NOTICE_MAX_FILES = 200;
+// Are this session's MODEL calls routed through the ACP proxy? Narrower than
+// launchedViaLauncher() on purpose: ACP_KEY authenticates the hook and can be
+// exported by someone running plain `claude`, whose model calls still go
+// straight to the provider. Only the base URL says where the tokens actually
+// went, and pricing decisions must follow that, not the credential.
+function modelCallsGoThroughProxy() {
+  return /agenticcontrolplane\.com/.test(`${process.env.ANTHROPIC_BASE_URL || ""} ${process.env.OPENAI_BASE_URL || ""}`);
+}
 function launchedViaLauncher() {
   if (process.env.ACP_KEY) return true;
   // Hand-rolled proxy env (ANTHROPIC_BASE_URL / OPENAI_BASE_URL at the ACP
@@ -1411,9 +1419,32 @@ function collectTranscriptUsage(path) {
     // Only consume complete lines; a partial trailing line waits for next time.
     const lastNl = chunk.lastIndexOf("\n");
     if (lastNl < 0) return undefined;
-    const consumed = Buffer.byteLength(chunk.slice(0, lastNl + 1), "utf8");
+    let consumed = Buffer.byteLength(chunk.slice(0, lastNl + 1), "utf8");
+    // One API call is appended as MANY records — one per content block as it
+    // streams. cache_read / cache_creation / input_tokens are fixed at request
+    // time and identical on every record, but output_tokens is a placeholder
+    // (commonly 1-8) until the FINAL record, which is the one that carries a
+    // terminal stop_reason. Measured over a month of local transcripts: 2,748
+    // calls sitting at output_tokens=3 and 2,263 at =2 on their partial rows.
+    //
+    // PostToolUse fires between a turn's records, so a turn's records can
+    // straddle two read windows. Send a partial and the gateway's first-wins
+    // dedupe locks that placeholder in and drops the real total when it
+    // arrives — the call bills at ~3 output tokens instead of thousands.
+    //
+    // So: only send turns we have seen completed, and hold the offset at the
+    // first byte of the first incomplete turn so its remaining records are
+    // re-read next time. A turn that never completes (an aborted or
+    // interrupted request — ~0.7% of calls) is never sent; losing those beats
+    // billing a placeholder for them. The stall is bounded: TRANSCRIPT_READ_CAP
+    // eventually slides `start` past a turn that is never finished.
     const turns = [];
+    const complete = new Set();
+    let holdAt = -1; // byte offset (relative to `start`) of the first incomplete turn
+    let lineStart = 0;
     for (const line of chunk.slice(0, lastNl).split("\n")) {
+      const thisLineStart = lineStart;
+      lineStart += Buffer.byteLength(line, "utf8") + 1; // +1 for the "\n"
       if (!line || line.indexOf('"usage"') < 0) continue;
       let e; try { e = JSON.parse(line); } catch { continue; }
       const m = e && e.message;
@@ -1421,6 +1452,9 @@ function collectTranscriptUsage(path) {
       if (!u || typeof u !== "object" || (e.type !== "assistant" && m.role !== "assistant")) continue;
       const id = (typeof m.id === "string" && m.id) || (typeof e.requestId === "string" && e.requestId) || (typeof e.uuid === "string" && e.uuid);
       if (!id || typeof m.model !== "string" || !m.model) continue;
+      const done = typeof m.stop_reason === "string" && m.stop_reason !== "";
+      if (done) complete.add(id);
+      else if (!complete.has(id) && holdAt < 0) holdAt = thisLineStart;
       turns.push({
         id, model: m.model,
         input_tokens: u.input_tokens || 0,
@@ -1430,6 +1464,7 @@ function collectTranscriptUsage(path) {
         ts: typeof e.timestamp === "string" ? e.timestamp : undefined,
       });
     }
+    if (holdAt >= 0) consumed = Math.min(consumed, holdAt);
     // Advance the offset only past what we are sending; keep the file small
     // (transcripts that no longer exist are dropped, at most
     // TRANSCRIPT_OFFSETS_KEEP others are kept).
@@ -1441,9 +1476,10 @@ function collectTranscriptUsage(path) {
       mkdirSync(ACP_DIR, { recursive: true });
       writeFileSync(TRANSCRIPT_OFFSETS, JSON.stringify(keep));
     } catch { /* best-effort — at worst a window is reported twice, and the gateway dedupes */ }
-    // Same-id turns can repeat across streamed chunks; keep the last (fullest).
+    // Same-id turns can repeat across streamed chunks; keep the last (fullest),
+    // and only turns whose final record we actually saw (see above).
     const byId = new Map();
-    for (const t of turns) byId.set(t.id, t);
+    for (const t of turns) if (complete.has(t.id)) byId.set(t.id, t);
     const out = Array.from(byId.values()).slice(-TRANSCRIPT_MAX_TURNS);
     return out.length ? out : undefined;
   } catch { return undefined; }
@@ -1467,7 +1503,14 @@ async function handlePostToolUse() {
   // Model turns since the last report (see collectTranscriptUsage). An
   // undefined value is dropped by JSON.stringify: the field is absent, not
   // an empty array, whenever there is nothing to report.
-  const modelUsage = collectTranscriptUsage(input.transcript_path);
+  //
+  // Skipped entirely when the harness is pointed at the ACP proxy: the proxy
+  // already priced those calls exactly, from the request itself, and
+  // reporting them again bills the same call twice. That was live from 0.18.0
+  // until now — proxy and transcript rows ~100ms apart with identical cost on
+  // every turn of a `claude-acp` session. The gateway carries the same guard
+  // for clients that never upgrade (proxy/proxySessions.ts).
+  const modelUsage = modelCallsGoThroughProxy() ? undefined : collectTranscriptUsage(input.transcript_path);
   const body = JSON.stringify({
     tool_name: input.tool_name,
     tool_input: input.tool_input,
