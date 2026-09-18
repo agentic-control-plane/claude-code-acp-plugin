@@ -74,13 +74,13 @@ beforeEach(() => {
 
 // Explicit env (never spread process.env): the runner's own CI=true would
 // flip the tier to background.
-function runHook(input) {
+function runHook(input, extraEnv) {
   return new Promise((resolve, reject) => {
     // ACP_KEY: a session started by claude-acp. Keeps the once-per-session
     // plain-launch notice (unpriced-session-notice.test.mjs) out of these
     // assertions, which are about the PostToolUse body alone.
     const child = spawn(process.execPath, [GOVERN], {
-      env: { HOME, PATH: process.env.PATH, ACP_GOVERN_BASE: baseUrl, CLAUDE_CODE_ENTRYPOINT: "cli", ACP_KEY: "gsk_test_deadbeef" },
+      env: { HOME, PATH: process.env.PATH, ACP_GOVERN_BASE: baseUrl, CLAUDE_CODE_ENTRYPOINT: "cli", ACP_KEY: "gsk_test_deadbeef", ...(extraEnv || {}) },
       stdio: ["pipe", "pipe", "pipe"],
     });
     let stdout = "";
@@ -172,8 +172,8 @@ test("malformed lines, non-assistant lines and turns without id/model are skippe
 test("id falls back to requestId, then uuid, when message.id is absent", async () => {
   const path = transcriptPath();
   writeFileSync(path,
-    JSON.stringify({ type: "assistant", requestId: "req_only", uuid: "uuid-1", message: { model: "claude-fable-5", role: "assistant", usage: { output_tokens: 3 } } }) + "\n" +
-    JSON.stringify({ type: "assistant", uuid: "uuid-2", message: { model: "claude-fable-5", role: "assistant", usage: { output_tokens: 4 } } }) + "\n");
+    JSON.stringify({ type: "assistant", requestId: "req_only", uuid: "uuid-1", message: { model: "claude-fable-5", role: "assistant", stop_reason: "end_turn", usage: { output_tokens: 3 } } }) + "\n" +
+    JSON.stringify({ type: "assistant", uuid: "uuid-2", message: { model: "claude-fable-5", role: "assistant", stop_reason: "end_turn", usage: { output_tokens: 4 } } }) + "\n");
   await runHook(post("sess-usage-4", path));
   assert.deepEqual(lastToolOutput().model_usage.map((t) => t.id), ["req_only", "uuid-2"]);
 });
@@ -278,4 +278,71 @@ test("PreToolUse is untouched: transcript_path on the payload adds nothing to /g
   const pre = seen.find((s) => s.url === "/govern/tool-use");
   assert.ok(pre);
   assert.ok(!("model_usage" in pre.body));
+});
+
+// ---------------------------------------------------------------------
+// A turn is reported only once its FINAL record lands.
+//
+// Claude Code appends one record per content block as a turn streams.
+// cache_read/cache_creation are identical on every record, but
+// output_tokens is a placeholder until the last one, which is also the
+// only record carrying a terminal stop_reason. PostToolUse fires between
+// those records, so without this a turn's partial record is sent first,
+// and the gateway's first-wins dedupe bills the placeholder forever.
+// ---------------------------------------------------------------------
+
+/** A mid-stream record: real cache counts, placeholder output, no stop_reason. */
+function partialLine(id, cacheRead, outSoFar) {
+  return JSON.stringify({
+    parentUuid: "p", isSidechain: false, type: "assistant", uuid: `uuid-${id}-partial-${outSoFar}`,
+    timestamp: "2026-09-16T21:00:00.000Z", requestId: `req_${id}`,
+    message: {
+      model: "claude-fable-5", id, type: "message", role: "assistant",
+      content: [{ type: "tool_use" }], stop_reason: null,
+      usage: { input_tokens: 2, cache_creation_input_tokens: 0, cache_read_input_tokens: cacheRead, output_tokens: outSoFar },
+    },
+  }) + "\n";
+}
+
+test("a turn still streaming is withheld, then billed at its real total once complete", async () => {
+  const path = transcriptPath();
+  // Window 1: only partial records for msg_S — exactly what the hook sees
+  // when it fires between a turn's tool calls.
+  writeFileSync(path, partialLine("msg_S", 126148, 3) + partialLine("msg_S", 126148, 3));
+  await runHook(post("sess-partial", path));
+  assert.ok(!("model_usage" in lastToolOutput()),
+    "a turn with no terminal stop_reason must not be reported");
+
+  // Window 2: the final record arrives carrying the true output total.
+  appendFileSync(path, assistantLine("msg_S", usage(2, 126148, 0, 10904)));
+  await runHook(post("sess-partial", path));
+  const sent = lastToolOutput().model_usage;
+  assert.deepEqual(sent, [
+    { id: "msg_S", model: "claude-fable-5", input_tokens: 2, cache_read_input_tokens: 126148,
+      cache_creation_input_tokens: 0, output_tokens: 10904, ts: "2026-09-16T21:00:00.000Z" },
+  ], "the completed turn must bill 10904 output tokens, not the 3-token placeholder");
+});
+
+test("an incomplete turn does not block the completed turns before it", async () => {
+  const path = transcriptPath();
+  writeFileSync(path, assistantLine("msg_done", usage(1, 10, 0, 500)) + partialLine("msg_live", 99, 2));
+  await runHook(post("sess-mixed", path));
+  assert.deepEqual(lastToolOutput().model_usage.map((t) => t.id), ["msg_done"]);
+});
+
+test("model calls routed through the ACP proxy are never reported from the transcript", async () => {
+  const path = transcriptPath();
+  writeFileSync(path, assistantLine("msg_P", usage(1, 2, 3, 400)));
+  // What claude-acp sets. The proxy already priced this call exactly; pricing
+  // it again from the transcript bills the same call twice.
+  await runHook(post("sess-proxied", path), { ANTHROPIC_BASE_URL: "https://api.agenticcontrolplane.com/anthropic" });
+  assert.ok(!("model_usage" in lastToolOutput()),
+    "a proxied session must not also report transcript usage");
+});
+
+test("a plain session still reports, so the proxy check is not just disabling the feature", async () => {
+  const path = transcriptPath();
+  writeFileSync(path, assistantLine("msg_Q", usage(1, 2, 3, 400)));
+  await runHook(post("sess-plain-2", path), { ANTHROPIC_BASE_URL: "https://api.anthropic.com" });
+  assert.deepEqual(lastToolOutput().model_usage.map((t) => t.id), ["msg_Q"]);
 });
