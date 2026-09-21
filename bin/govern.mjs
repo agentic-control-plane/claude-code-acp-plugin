@@ -67,7 +67,7 @@ const ACP_GOVERN =
   process.env.ACP_API_BASE ||
   "https://govern.agenticcontrolplane.com";
 
-const PLUGIN_VERSION = "0.23.0";
+const PLUGIN_VERSION = "0.24.0";
 
 // Console base for user-facing deep links (session receipt, #606).
 const ACP_CONSOLE =
@@ -1389,22 +1389,87 @@ async function handlePreToolUse() {
 // every branch: a missing, unreadable, truncated or malformed transcript
 // returns undefined (the field is simply absent — never an empty array,
 // never a throw) and can never touch the decision or delay the call.
-// The offset advances past what is being sent before the request goes
-// out, so a turn is normally reported once; the gateway's (session, id)
-// dedupe absorbs retries. A partial trailing line is left for next time.
+// A partial trailing line is left for next time.
+//
+// Send-after-ack (gatewaystack-connect#1279). The offset moves only after
+// the gateway answered 2xx for the batch that covered it. Until 0.23.0 it
+// moved BEFORE the request went out, and a 4xx/5xx/timeout on the
+// tool-output call silently lost that window's turns for good — there was
+// no retry, and the field is not in the offline ledger. Now a failed send
+// leaves the offset where it was, so the next PostToolUse re-reads the same
+// window and sends it again. Bounded: after TRANSCRIPT_SEND_ATTEMPTS
+// failures on the same batch the offset moves past it anyway and one line
+// goes to ~/.acp/lapse.log, so a gateway that rejects every call cannot pin
+// a session on a 2 MB re-read forever. A retry after a 2xx whose response
+// was lost in transit (the gateway priced the batch, we never heard) is a
+// real re-send; the gateway's durable (session, id) dedupe is what absorbs
+// that, and that is the only case it now has to absorb routinely.
+//
+// The offsets file (`{ [transcript]: { off, acked, attempts, dropped } }`;
+// a bare number is the pre-0.24.0 shape and still reads) also keeps the
+// last TRANSCRIPT_ACKED_KEEP turn ids the gateway acknowledged per
+// transcript. They matter behind a held turn: `holdAt` pins the offset at
+// the first incomplete turn (see below) so its remaining records are
+// re-read, and every completed turn after it gets re-read too — 0.23.0
+// re-SENT those on every tool call for the rest of the session. Acked ids
+// are filtered out before the batch is built, so the steady state behind a
+// hold is a bounded re-read and an empty send, not a re-send.
 const TRANSCRIPT_OFFSETS = join(ACP_DIR, "transcript-offsets.json");
 const TRANSCRIPT_READ_CAP = 2 * 1024 * 1024;
+const TRANSCRIPT_HOLD_CAP = 256 * 1024;
 const TRANSCRIPT_MAX_TURNS = 50;
 const TRANSCRIPT_OFFSETS_KEEP = 40;
+const TRANSCRIPT_ACKED_KEEP = 200;
+const TRANSCRIPT_SEND_ATTEMPTS = 3;
+function readTranscriptOffsets() {
+  let offsets = {};
+  try { offsets = JSON.parse(readFileSync(TRANSCRIPT_OFFSETS, "utf8")) || {}; } catch { offsets = {}; }
+  if (!offsets || typeof offsets !== "object" || Array.isArray(offsets)) offsets = {};
+  return offsets;
+}
+function transcriptEntry(raw) {
+  const empty = { off: 0, acked: [], attempts: 0, dropped: 0 };
+  if (typeof raw === "number") return { ...empty, off: raw >= 0 ? raw : 0 };
+  if (!raw || typeof raw !== "object") return empty;
+  const num = (v) => (typeof v === "number" && Number.isFinite(v) && v > 0 ? Math.floor(v) : 0);
+  return {
+    off: num(raw.off),
+    acked: Array.isArray(raw.acked) ? raw.acked.filter((x) => typeof x === "string").slice(-TRANSCRIPT_ACKED_KEEP) : [],
+    attempts: num(raw.attempts),
+    dropped: num(raw.dropped),
+  };
+}
+// Keep the file small: transcripts that no longer exist are dropped, at
+// most TRANSCRIPT_OFFSETS_KEEP others are kept. Best-effort — at worst a
+// window is reported twice, and the gateway dedupes.
+function writeTranscriptEntry(offsets, path, entry) {
+  try {
+    const keep = {};
+    let n = 0;
+    for (const [k, v] of Object.entries(offsets)) { if (k !== path && existsSync(k) && n++ < TRANSCRIPT_OFFSETS_KEEP) keep[k] = v; }
+    keep[path] = entry;
+    mkdirSync(ACP_DIR, { recursive: true });
+    writeFileSync(TRANSCRIPT_OFFSETS, JSON.stringify(keep));
+  } catch { /* best-effort */ }
+}
+// Under-counted model usage is a lapse in the cost record; it goes where
+// the other lapses go, one JSON line per event, never to the model.
+function transcriptLapse(event, detail) {
+  try {
+    appendFileSync(join(ACP_DIR, "lapse.log"), JSON.stringify({ at: new Date().toISOString(), event, ...detail }) + "\n");
+  } catch { /* best-effort */ }
+}
+// Returns undefined when there is nothing to send, else { turns, ack, fail }:
+// the caller sends `turns` and reports the outcome with exactly one of
+// ack() (gateway said 2xx) or fail() (anything else). Neither throws.
 function collectTranscriptUsage(path) {
   try {
     if (typeof path !== "string" || !path || !existsSync(path)) return undefined;
-    let offsets = {};
-    try { offsets = JSON.parse(readFileSync(TRANSCRIPT_OFFSETS, "utf8")) || {}; } catch { offsets = {}; }
-    if (!offsets || typeof offsets !== "object" || Array.isArray(offsets)) offsets = {};
+    const offsets = readTranscriptOffsets();
+    const entry = transcriptEntry(offsets[path]);
     let size = 0;
     try { size = statSync(path).size; } catch { return undefined; }
-    let start = typeof offsets[path] === "number" && offsets[path] >= 0 && offsets[path] <= size ? offsets[path] : 0;
+    let start = entry.off <= size ? entry.off : 0;
     if (size - start > TRANSCRIPT_READ_CAP) start = size - TRANSCRIPT_READ_CAP;
     if (size <= start) return undefined;
     let chunk = "";
@@ -1419,7 +1484,8 @@ function collectTranscriptUsage(path) {
     // Only consume complete lines; a partial trailing line waits for next time.
     const lastNl = chunk.lastIndexOf("\n");
     if (lastNl < 0) return undefined;
-    let consumed = Buffer.byteLength(chunk.slice(0, lastNl + 1), "utf8");
+    const lineEnd = Buffer.byteLength(chunk.slice(0, lastNl + 1), "utf8");
+    let consumed = lineEnd;
     // One API call is appended as MANY records — one per content block as it
     // streams. cache_read / cache_creation / input_tokens are fixed at request
     // time and identical on every record, but output_tokens is a placeholder
@@ -1436,10 +1502,19 @@ function collectTranscriptUsage(path) {
     // first byte of the first incomplete turn so its remaining records are
     // re-read next time. A turn that never completes (an aborted or
     // interrupted request — ~0.7% of calls) is never sent; losing those beats
-    // billing a placeholder for them. The stall is bounded: TRANSCRIPT_READ_CAP
-    // eventually slides `start` past a turn that is never finished.
+    // billing a placeholder for them. The stall is bounded twice over:
+    // TRANSCRIPT_HOLD_CAP moves the offset past a held region that has grown
+    // beyond 256 KB (one lapse line says so), and TRANSCRIPT_READ_CAP slides
+    // `start` regardless.
     const turns = [];
     const complete = new Set();
+    // First byte (relative to `start`) of each turn's first partial record.
+    // The hold is decided AFTER the loop, on turns still incomplete at the
+    // end of the window: 0.23.0 fixed it at the first partial record it met,
+    // so a turn whose final record arrived later in the SAME window kept the
+    // offset pinned anyway — and every completed turn was re-sent on every
+    // call for the rest of the session.
+    const pendingAt = new Map();
     let holdAt = -1; // byte offset (relative to `start`) of the first incomplete turn
     let lineStart = 0;
     for (const line of chunk.slice(0, lastNl).split("\n")) {
@@ -1454,7 +1529,7 @@ function collectTranscriptUsage(path) {
       if (!id || typeof m.model !== "string" || !m.model) continue;
       const done = typeof m.stop_reason === "string" && m.stop_reason !== "";
       if (done) complete.add(id);
-      else if (!complete.has(id) && holdAt < 0) holdAt = thisLineStart;
+      else if (!complete.has(id) && !pendingAt.has(id)) pendingAt.set(id, thisLineStart);
       turns.push({
         id, model: m.model,
         input_tokens: u.input_tokens || 0,
@@ -1464,24 +1539,54 @@ function collectTranscriptUsage(path) {
         ts: typeof e.timestamp === "string" ? e.timestamp : undefined,
       });
     }
-    if (holdAt >= 0) consumed = Math.min(consumed, holdAt);
-    // Advance the offset only past what we are sending; keep the file small
-    // (transcripts that no longer exist are dropped, at most
-    // TRANSCRIPT_OFFSETS_KEEP others are kept).
-    try {
-      const keep = {};
-      let n = 0;
-      for (const [k, v] of Object.entries(offsets)) { if (k !== path && existsSync(k) && n++ < TRANSCRIPT_OFFSETS_KEEP) keep[k] = v; }
-      keep[path] = start + consumed;
-      mkdirSync(ACP_DIR, { recursive: true });
-      writeFileSync(TRANSCRIPT_OFFSETS, JSON.stringify(keep));
-    } catch { /* best-effort — at worst a window is reported twice, and the gateway dedupes */ }
+    for (const [id, at] of pendingAt) if (!complete.has(id) && (holdAt < 0 || at < holdAt)) holdAt = at;
+    if (holdAt >= 0) {
+      if (lineEnd - holdAt > TRANSCRIPT_HOLD_CAP) {
+        // The incomplete turn is abandoned (never sent) and the window
+        // moves on; if its final record does land later it is a complete
+        // turn in a later window and bills at its real total then.
+        transcriptLapse("transcript-hold-cap", { transcript: path, held_bytes: lineEnd - holdAt });
+      } else {
+        consumed = holdAt;
+      }
+    }
     // Same-id turns can repeat across streamed chunks; keep the last (fullest),
-    // and only turns whose final record we actually saw (see above).
+    // only turns whose final record we actually saw, and none the gateway has
+    // already acknowledged (the re-read behind a hold).
+    const acked = new Set(entry.acked);
     const byId = new Map();
-    for (const t of turns) if (complete.has(t.id)) byId.set(t.id, t);
+    for (const t of turns) if (complete.has(t.id) && !acked.has(t.id)) byId.set(t.id, t);
     const out = Array.from(byId.values()).slice(-TRANSCRIPT_MAX_TURNS);
-    return out.length ? out : undefined;
+    const next = start + consumed;
+    if (!out.length) {
+      // Nothing to send, so nothing to lose: move on now. No write when the
+      // offset would not change — the steady state behind a hold is a read.
+      if (next !== entry.off || entry.attempts) writeTranscriptEntry(offsets, path, { ...entry, off: next, attempts: 0 });
+      return undefined;
+    }
+    const sentIds = out.map((t) => t.id);
+    return {
+      turns: out,
+      settled: false,
+      ack() {
+        this.settled = true;
+        writeTranscriptEntry(offsets, path, { ...entry, off: next, acked: entry.acked.concat(sentIds).slice(-TRANSCRIPT_ACKED_KEEP), attempts: 0 });
+      },
+      fail() {
+        this.settled = true;
+        const attempts = entry.attempts + 1;
+        if (attempts < TRANSCRIPT_SEND_ATTEMPTS) {
+          writeTranscriptEntry(offsets, path, { ...entry, attempts });
+          return;
+        }
+        // Give up on this batch: the offset moves past it, the ids are NOT
+        // marked acked (they were not), and the loss is on record. Logged on
+        // the first drop per transcript; later drops are counted, not logged.
+        const dropped = entry.dropped + 1;
+        if (dropped === 1) transcriptLapse("transcript-usage-dropped", { transcript: path, turns: out.length, attempts });
+        writeTranscriptEntry(offsets, path, { ...entry, off: next, attempts: 0, dropped });
+      },
+    };
   } catch { return undefined; }
 }
 
@@ -1510,7 +1615,8 @@ async function handlePostToolUse() {
   // until now — proxy and transcript rows ~100ms apart with identical cost on
   // every turn of a `claude-acp` session. The gateway carries the same guard
   // for clients that never upgrade (proxy/proxySessions.ts).
-  const modelUsage = modelCallsGoThroughProxy() ? undefined : collectTranscriptUsage(input.transcript_path);
+  const collected = modelCallsGoThroughProxy() ? undefined : collectTranscriptUsage(input.transcript_path);
+  const modelUsage = collected ? collected.turns : undefined;
   const body = JSON.stringify({
     tool_name: input.tool_name,
     tool_input: input.tool_input,
@@ -1529,7 +1635,10 @@ async function handlePostToolUse() {
   try {
     const res = await fetch(`${ACP_GOVERN}/govern/tool-output`, { method: "POST", headers, body, signal: controller.signal });
     clearTimeout(timeout);
-    if (!res.ok) { process.exit(0); }
+    // The offset behind `model_usage` moves only on a 2xx (#1279); any
+    // other outcome leaves it for the next PostToolUse to retry, bounded.
+    if (!res.ok) { if (collected) collected.fail(); process.exit(0); }
+    if (collected) collected.ack();
     if (preLapse) clearPendingLapse(input.session_id);
     const data = await res.json();
     // Receipt bookkeeping (#606): one governed call, plus what ACP said
@@ -1561,7 +1670,9 @@ async function handlePostToolUse() {
       process.stdout.write(JSON.stringify({ systemMessage: staleNotice }));
     }
   } catch {
-    // silent pass-through
+    // silent pass-through for the verdict; the usage batch is retried next
+    // time (a 2xx whose body failed to parse was already acked above).
+    if (collected && !collected.settled) collected.fail();
   } finally { clearTimeout(timeout); }
   process.exit(0);
 }
