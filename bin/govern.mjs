@@ -698,26 +698,20 @@ async function runLocal(input) {
   try {
     policy = JSON.parse(readFileSync(join(ACP_DIR, "policy.json"), "utf8"));
   } catch { /* no/invalid policy → defaults above; the safety floor still applies */ }
-  // The decision engine: prefer the installed copy (~/.acp/decide.mjs, kept
-  // current by the installer), fall back to the copy bundled next to this
-  // file (standalone plugin installs that never ran install.sh).
-  let decide;
-  try {
-    ({ decide } = await import(pathToFileURL(join(ACP_DIR, "decide.mjs")).href));
-  } catch {
-    try {
-      ({ decide } = await import("./decide.mjs"));
-    } catch {
-      // Engine missing/corrupt → never brick, but NEVER silently: say it
-      // loud and leave an audit line, same contract as the cloud path.
-      audit({ ts: new Date().toISOString(), event: "pre", client: ACP_CLIENT, tool: input.tool_name,
-              decision: "allow", source: "fail-open", reason: "local engine unavailable (~/.acp/decide.mjs)" });
-      process.stdout.write(JSON.stringify({
-        systemMessage: "[ACP·local] ⚠ decision engine unavailable (~/.acp/decide.mjs) — this call ran UNGOVERNED and was allowed. Re-run the installer to restore it.",
-      }));
-      return;
-    }
+  // The decision engine is the one loadEngine() already vetted (#1277
+  // MED-6): an installed ~/.acp/decide.mjs that predates uninstallFloor is
+  // skipped for the bundled copy here too, so ACP_LOCAL=1 never runs the
+  // exit through a stale engine. Missing everywhere → never brick, but
+  // NEVER silently: say it loud and leave an audit line.
+  if (!ENGINE) {
+    audit({ ts: new Date().toISOString(), event: "pre", client: ACP_CLIENT, tool: input.tool_name,
+            decision: "allow", source: "fail-open", reason: "local engine unavailable (~/.acp/decide.mjs)" });
+    process.stdout.write(JSON.stringify({
+      systemMessage: "[ACP·local] ⚠ decision engine unavailable (~/.acp/decide.mjs) — this call ran UNGOVERNED and was allowed. Re-run the installer to restore it.",
+    }));
+    return;
   }
+  const { decide } = ENGINE;
   const ctx = await readContext(input);
   const d = decide(input.tool_name, input.tool_input, policy, { ...(ctx || {}), harness: HARNESS, cwd: input.cwd });
   // The ledger mirrors audit.jsonl for local-policy calls so a later connect

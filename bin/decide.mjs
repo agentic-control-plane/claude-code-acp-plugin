@@ -221,13 +221,31 @@ function bashUnits(toolName, toolInput) {
  * by a Bash.unknown rule, still falls back to "Bash" in the policy walk, and
  * honestly labeled as unparsed in the audit line rather than silently benign.
  */
+const HEREDOC_DELIM_RE = /<<(?!<)-?\s*(?:"([A-Za-z_][\w-]*)"|'([A-Za-z_][\w-]*)'|\\?([A-Za-z_][\w-]*))/g;
+/** Drop heredoc terminator lines (`EOF`) from stripped text: stripDataHeredocs
+ *  keeps them so its output still pairs, but for classification they are
+ *  not commands. `raw` is the original text the delimiters come from. */
+function stripHeredocTerminators(stripped, raw) {
+  if (!raw.includes("<<")) return stripped;
+  const delims = new Set();
+  let m;
+  HEREDOC_DELIM_RE.lastIndex = 0;
+  while ((m = HEREDOC_DELIM_RE.exec(raw)) !== null) delims.add(m[1] || m[2] || m[3]);
+  if (!delims.size) return stripped;
+  return stripped.split("\n").filter((l) => !delims.has(l.trim())).join("\n");
+}
+
 export function classifyTool(toolName, toolInput) {
   const name = String(toolName || "");
   const input = typeof toolInput === "string" ? safeParse(toolInput) : (toolInput || {});
 
   if (name === "Bash" || name === "run_terminal_cmd" || name === "shell") {
     const cmd = String(input.command || input.cmd || "");
-    const units = commandUnits(cmd);
+    // A heredoc body written to a file is data, not a command line: a
+    // `cat > deploy.ps1 <<'EOF' … Remove-Item … EOF` is Bash.cat, the same
+    // class the gateway gives it (gatewaystack-connect#1277 HIGH-2). The
+    // terminator line is dropped too — a lone `EOF` is not a command.
+    const units = commandUnits(stripHeredocTerminators(stripDataHeredocs(cmd), cmd));
     if (!units.length) return cmd.trim() ? "Bash.unknown" : "Bash";
     let best = units[0];
     for (const u of units) if (privilegeRank(u.bin) > privilegeRank(best.bin)) best = u;
@@ -719,16 +737,99 @@ export function maskQuotedProse(s) {
 // Same fixtures as the gateway's floor, so an offline call and a governed
 // call agree.
 
-const UNINSTALL_CMD_RE = /(?:^|[;&|]\s*|\$\(\s*)(?:(?:sudo|doas|env|nice|nohup|setsid|stdbuf|timeout|time|command|builtin)\s+(?:-\S+\s+)*)*(?:\S*[/\\])?acp-uninstall(?:\.cmd)?(?=\s|$|[;&|)])/m;
-const UNINSTALL_SCRIPT_RE = /(?:^|[;&|]\s*|\$\(\s*)(?:(?:ba|z|da|k)?sh|pwsh|powershell)(?:\.exe)?\b[^\n;|&]*[/\\]\.acp[/\\]uninstall\.(?:sh|ps1)\b/im;
+// Mirrors the gateway's riskClassifier.ts (#1277): same regexes, same
+// per-statement variable rule, so an offline call and a governed call agree.
+const UNINSTALL_WRAPPER = String.raw`(?:(?:sudo|doas|env|nice|nohup|setsid|stdbuf|timeout|time|command|builtin)\s+(?:-\S+\s+)*)*`;
+// `command acp-uninstall`, `npx acp-uninstall`, and a QUOTED full path
+// (`"$HOME/.acp/bin/acp-uninstall"`) are still the uninstaller in command position.
+const UNINSTALL_CMD_RE = new RegExp(
+  String.raw`(?:^|[;&|]\s*|\$\(\s*)${UNINSTALL_WRAPPER}(?:(?:npx|pnpx|bunx)\s+(?:-\S+\s+)*)?['"]?(?:\S*[/\\])?acp-uninstall(?:\.cmd)?(?=['"\s;&|)]|$)`,
+  "m",
+);
+// The cached uninstaller run by a launcher (`bash …`, `bash < …`, `source …`,
+// `. …`, PowerShell's `& "…\uninstall.ps1"`) …
+const UNINSTALL_SCRIPT_RE = new RegExp(
+  String.raw`(?:^|[;&|]\s*|\$\(\s*)${UNINSTALL_WRAPPER}(?:(?:(?:ba|z|da|k)?sh|pwsh|powershell)(?:\.exe)?\b|source\b|\.(?=\s)|&(?=\s))[^\n;|&]*?[/\\]\.acp[/\\]uninstall\.(?:sh|ps1)\b`,
+  "im",
+);
+// … or executed directly (`~/.acp/uninstall.sh`).
+const UNINSTALL_SCRIPT_DIRECT_RE = /(?:^|[;&|]\s*|\$\(\s*)['"]?\S*[/\\]\.acp[/\\]uninstall\.(?:sh|ps1)\b/im;
 const UNINSTALL_FETCH_RE = /\b(?:curl|wget|irm|iwr|Invoke-WebRequest|Invoke-RestMethod)\b[^\n]*?agenticcontrolplane\.com\/uninstall\.(?:sh|ps1)\b/i;
+// `find ~/.acp -delete` / `find ~ -name .acp -exec rm -rf {} +`.
+const FIND_DELETE_RE = /\bfind\b[^\n;|&]*?[\s'"/\\]\.acp(?![\w.-])[^\n;|&]*?\s(?:-delete\b|-exec\s+(?:\S*[/\\])?(?:rm|rmdir|unlink)\b)/i;
+// Inline scripts are quoted spans with whitespace (blanked by the prose
+// mask): scan the RAW literal for a tree-delete call naming .acp.
+const SCRIPT_LITERAL_RE = /\b(?:python\d?(?:\.\d+)?|node|ruby|perl)\b[^\n]*?\s-[a-zA-Z]*[ce]\s+(['"])([\s\S]*?)\1/gi;
+const SCRIPT_DELETE_CALL_RE = /\b(?:rmtree|rmSync|rmdirSync|rm_rf|rm_r|remove_tree|rimraf|removeSync|remove_dir_all)\b/;
+const SCRIPT_ACP_RE = /[/\\'"]\.acp(?![\w.-])/;
+// Turning the plugin off is the other exit.
+const PLUGIN_DISABLE_RE = new RegExp(
+  String.raw`(?:^|[;&|]\s*|\$\(\s*)${UNINSTALL_WRAPPER}(?:\S*[/\\])?claude(?:\.cmd|\.exe)?\s+plugins?\s+(?:disable|uninstall|remove|rm)\b[^\n;|&]*?(?:\s|['"])(?:agentic-control-plane|acp)(?![\w-])`,
+  "im",
+);
+// Any recursive-delete statement, POSIX / PowerShell / cmd.exe (`rd /s`).
 const RECURSIVE_DELETE_RE = /\b(?:remove-item|ri|rm|del|erase|rd|rmdir)\b([^\n;|&]*)/gi;
-const RECURSE_FLAG_RE = /\s-(?!force\b)(?:recurse|[a-z]{0,3}r[a-z]{0,3})(?=\s|$)/i;
-const VAR_OPERAND_RE = /(?:^|\s|\(|["'])\$(?:\{|env:|[A-Za-z_])/;
-const ACP_DIR_MENTION_RE = /(?:^|[\s\\/'"(=])\.acp(?=[\\/'"\s)]|$)/m;
+const RECURSE_FLAG_RE = /\s(?:-(?!force\b)(?:recurse|[a-z]{0,3}r[a-z]{0,3})|\/s)(?=\s|$)/i;
+const VAR_OPERAND_RE = /(?:^|\s|\(|["'])(?:\$(?:\{|env:|[A-Za-z_])|%[A-Za-z_]\w*%)/;
+// `.acp` as a path component: NOT continued by a name character, so
+// `.acp;` / `.acp&` / `.acp,` are the dir; `.acpx`, `.acp-cache` are not.
+const ACP_DIR_MENTION_RE = /(?:^|[\s\\/'"(=])\.acp(?![\w.-])/m;
+const SEGMENT_SPLIT_RE = /(\n|;|&&|\|\||\||&)/;
+const ASSIGN_RE = /(?:^|[\s(;{])(?:(?:export|declare|local|readonly|typeset|set)\s+(?:-\w+\s+)*)?\$?(?:env:)?([A-Za-z_]\w*)\s*=(?!=)/gi;
+const LOOP_BIND_RE = /\b(?:for|foreach)\s*\(?\s*\$?([A-Za-z_]\w*)\s+in\b/gi;
+const VAR_REF_RE = /\$\{?(?:env:)?([A-Za-z_]\w*)|%([A-Za-z_]\w*)%/g;
 const PS_SHAPE_RE = /\$env:[A-Za-z_]\w*|\[[A-Za-z][\w.]*\]::|\s-ErrorAction\b|\b(?:Join-Path|Remove-Item|Write-Host|Test-Path|Get-ChildItem|Get-Content|Set-Content|Out-File|New-Item|Copy-Item|Move-Item|Invoke-WebRequest|Invoke-RestMethod|Invoke-Expression|Start-Process)\b/i;
 // PowerShell's `-Command`/`-c` string is a launder the same way `sh -c` is.
 const PWSH_COMMAND_RE = /\b(?:powershell|pwsh)(?:\.exe)?\b[^'"\n;|&]*?\s-(?:c|command)\s+(['"])([\s\S]*?)\1/gi;
+
+/** Drop `# …` comments (a `#` at line start or after whitespace). Apply
+ *  AFTER the quote mask so a `#` inside a short quoted operand survives. */
+export function stripShellComments(s) {
+  return s.includes("#") ? s.replace(/(^|\s)#[^\n]*/g, "$1") : s;
+}
+
+function referencesVar(text, names) {
+  if (!names.size) return false;
+  VAR_REF_RE.lastIndex = 0;
+  let m;
+  while ((m = VAR_REF_RE.exec(text)) !== null) {
+    if (names.has((m[1] || m[2] || "").toLowerCase())) return true;
+  }
+  return false;
+}
+
+/** The variable rule, per statement: a recursive delete of `$var` fires only
+ *  when its OWN segment names `.acp`, or `$var` was bound to a `.acp` path in
+ *  an earlier segment, or the operand arrives by pipeline from a segment
+ *  that names `.acp`. */
+function recursiveDeleteOfAcp(masked) {
+  const parts = masked.split(SEGMENT_SPLIT_RE);
+  const acpVars = new Set();
+  let prevMentions = false;
+  for (let i = 0; i < parts.length; i += 2) {
+    const seg = parts[i];
+    const sep = i > 0 ? parts[i - 1] : "";
+    const mentions = ACP_DIR_MENTION_RE.test(seg) || referencesVar(seg, acpVars);
+    if (mentions) {
+      let b;
+      ASSIGN_RE.lastIndex = 0;
+      while ((b = ASSIGN_RE.exec(seg)) !== null) acpVars.add(b[1].toLowerCase());
+      LOOP_BIND_RE.lastIndex = 0;
+      while ((b = LOOP_BIND_RE.exec(seg)) !== null) acpVars.add(b[1].toLowerCase());
+    }
+    const piped = sep === "|" && prevMentions;
+    prevMentions = mentions;
+    RECURSIVE_DELETE_RE.lastIndex = 0;
+    let m;
+    while ((m = RECURSIVE_DELETE_RE.exec(seg)) !== null) {
+      const args = m[1] || "";
+      if (!RECURSE_FLAG_RE.test(args)) continue;
+      if (ACP_DIR_MENTION_RE.test(args) || piped) return true;
+      if (VAR_OPERAND_RE.test(args) && (mentions || referencesVar(args, acpVars))) return true;
+    }
+  }
+  return false;
+}
 
 /** Ask-level floor for an agent-initiated ACP removal: the label, or null. */
 export function uninstallFloor(toolName, toolInput) {
@@ -746,19 +847,22 @@ export function uninstallFloor(toolName, toolInput) {
   let m;
   PWSH_COMMAND_RE.lastIndex = 0;
   while ((m = PWSH_COMMAND_RE.exec(cmd)) !== null) texts.push(m[2]);
-  const pwsh = PS_SHAPE_RE.test(maskQuotedProse(cmd));
+  // Heredoc bodies and comments do not make a line PowerShell (#1277).
+  const pwsh = PS_SHAPE_RE.test(stripShellComments(maskQuotedProse(stripDataHeredocs(cmd))));
   for (const t of texts) {
-    const masked = maskQuotedProse(stripDataHeredocs(t));
-    if (UNINSTALL_CMD_RE.test(masked) || UNINSTALL_SCRIPT_RE.test(masked)) return "runs the ACP uninstaller";
+    const masked = stripShellComments(maskQuotedProse(stripDataHeredocs(t)));
+    if (UNINSTALL_CMD_RE.test(masked) || UNINSTALL_SCRIPT_RE.test(masked) || UNINSTALL_SCRIPT_DIRECT_RE.test(masked)) {
+      return "runs the ACP uninstaller";
+    }
     if (UNINSTALL_FETCH_RE.test(masked)) return "fetches the ACP uninstaller";
-    const mentionsAcp = ACP_DIR_MENTION_RE.test(masked);
-    RECURSIVE_DELETE_RE.lastIndex = 0;
-    while ((m = RECURSIVE_DELETE_RE.exec(masked)) !== null) {
-      const args = m[1] || "";
-      if (!RECURSE_FLAG_RE.test(args)) continue;
-      if (ACP_DIR_MENTION_RE.test(args) || (mentionsAcp && VAR_OPERAND_RE.test(args))) {
-        return `removes the ACP directory (${pwsh ? "PowerShell" : "shell"})`;
-      }
+    if (PLUGIN_DISABLE_RE.test(masked)) return "disables the ACP plugin";
+    if (FIND_DELETE_RE.test(masked) || recursiveDeleteOfAcp(masked)) {
+      return `removes the ACP directory (${pwsh ? "PowerShell" : "shell"})`;
+    }
+    SCRIPT_LITERAL_RE.lastIndex = 0;
+    let s;
+    while ((s = SCRIPT_LITERAL_RE.exec(t)) !== null) {
+      if (SCRIPT_DELETE_CALL_RE.test(s[2]) && SCRIPT_ACP_RE.test(s[2])) return "removes the ACP directory (script)";
     }
   }
   return null;

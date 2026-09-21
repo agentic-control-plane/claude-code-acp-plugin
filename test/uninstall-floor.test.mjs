@@ -9,7 +9,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { uninstallFloor, decide } from "../bin/decide.mjs";
+import { uninstallFloor, decide, classifyTool } from "../bin/decide.mjs";
 
 const u = (command) => uninstallFloor("Bash", { command });
 
@@ -61,6 +61,84 @@ test("benign PowerShell and prose never fire", () => {
     "acp-uninstall-notes.md",
     "cat acp-uninstall.md",
   ]) assert.equal(u(cmd), null, cmd);
+});
+
+test("#1277 HIGH-1: the semicolon-joined variable spellings fire (`.acp;` is the dir)", () => {
+  for (const cmd of [
+    'd=~/.acp; rm -rf "$d"',
+    "d=$HOME/.acp; rm -rf $d",
+    "export ACP=~/.acp; rm -rf $ACP",
+    "sh -c 'd=~/.acp; rm -rf $d'",
+    "d=~/.acp\nrm -rf \"$d\"",
+    "d=~/.acp && rm -rf \"$d\"",
+    "(d=~/.acp; rm -rf \"$d\")",
+    "d=$(echo ~/.acp); rm -rf $d",
+  ]) assert.equal(u(cmd), "removes the ACP directory (shell)", cmd);
+  assert.equal(
+    u("$acp = Join-Path $env:USERPROFILE '.acp'\nif (Test-Path $acp) {\n  Remove-Item -Recurse -Force $acp\n}"),
+    "removes the ACP directory (PowerShell)",
+  );
+});
+
+test("#1277 MED-3: the variable rule is per statement — `.acp` elsewhere in the payload is not an operand", () => {
+  for (const cmd of [
+    "rm -rf $TMP && cat ~/.acp/lapse.log",
+    'for d in $(ls); do rm -rf "$d"; done; cat .acp/config',
+    "rm -r $BUILD_DIR   # keep .acp",
+    'DIR=dist; rm -rf "$DIR"; echo \'see .acp/lapse.log\'',
+    'rm -rf "$OUT"; ls .acp',
+    "rm -rf $DIR\nls ~/.acp",
+    "Remove-Item -Recurse -Force $build; Write-Host \"acp: see .acp/lapse.log\"",
+    "rmdir /s /q build && dir .acp",
+  ]) assert.equal(u(cmd), null, cmd);
+});
+
+test("#1277 MED-4: wrappers, quoted paths, launchers, find, inline scripts, pipelines, cmd.exe, plugin disable", () => {
+  for (const cmd of [
+    "command acp-uninstall",
+    '"$HOME/.acp/bin/acp-uninstall"',
+    "npx acp-uninstall",
+    "source ~/.acp/uninstall.sh",
+    ". ~/.acp/uninstall.sh",
+    "bash < ~/.acp/uninstall.sh",
+    "~/.acp/uninstall.sh",
+    "sudo bash ~/.acp/uninstall.sh",
+    '& "$env:USERPROFILE\\.acp\\uninstall.ps1"',
+  ]) assert.equal(u(cmd), "runs the ACP uninstaller", cmd);
+  for (const cmd of [
+    "find ~/.acp -delete",
+    "find ~ -maxdepth 1 -name .acp -exec rm -rf {} +",
+    "Get-ChildItem $env:USERPROFILE\\.acp -Recurse | Remove-Item -Force -Recurse",
+    "ls -d ~/.acp | xargs rm -rf",
+    "set d=%USERPROFILE%\\.acp & rd /s /q %d%",
+  ]) assert.match(u(cmd), /^removes the ACP directory/, cmd);
+  for (const cmd of [
+    "python3 -c \"import shutil,os; shutil.rmtree(os.path.expanduser('~/.acp'))\"",
+    "node -e \"require('fs').rmSync(require('os').homedir()+'/.acp',{recursive:true})\"",
+  ]) assert.equal(u(cmd), "removes the ACP directory (script)", cmd);
+  for (const cmd of [
+    "claude plugin disable agentic-control-plane",
+    "claude plugin uninstall acp",
+    "claude plugin remove agentic-control-plane@acp-marketplace",
+  ]) assert.equal(u(cmd), "disables the ACP plugin", cmd);
+});
+
+test("#1277 adversarial: the review's refuted false positives stay null; comments/heredocs don't flip the label", () => {
+  for (const cmd of [
+    "rm -rf node_modules/.acp-cache",
+    "rm -rf .acpx",
+    "rm -rf ~/.acp-backup",
+    "npm uninstall acp-client",
+    "git checkout -- .acp",
+    "docker rm -f acp-uninstall",
+    "cat docs/acp-uninstall.md",
+    "Remove-Item -Recurse .\\build",
+    "claude plugin disable acp-foo",
+    "find . -name '*.pyc' -delete",
+  ]) assert.equal(u(cmd), null, cmd);
+  assert.equal(u("d=~/.acp; rm -rf $d # Remove-Item"), "removes the ACP directory (shell)");
+  assert.equal(classifyTool("Bash", { command: "rm -rf ~/work/scratch # Remove-Item" }), "Bash.rm");
+  assert.equal(classifyTool("Bash", { command: "cat > deploy.ps1 <<'EOF'\nRemove-Item -Recurse dist\nEOF" }), "Bash.cat");
 });
 
 test("decide(): tightens an allow to ask; a policy deny still wins; non-shell tools untouched", () => {

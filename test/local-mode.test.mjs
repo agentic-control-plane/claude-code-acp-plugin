@@ -190,3 +190,26 @@ test("ACP_LOCAL=1 with no policy file: floor still active, default allow for the
     rmSync(bare, { recursive: true, force: true });
   }
 });
+
+test("#1277 MED-6: ACP_LOCAL=1 with a STALE ~/.acp/decide.mjs (no uninstallFloor) still asks on acp-uninstall — runLocal uses the same vetted engine as loadEngine", () => {
+  const stale = mkdtempSync(join(tmpdir(), "acp-local-stale-"));
+  try {
+    mkdirSync(join(stale, ".acp"), { recursive: true });
+    // An installed engine from before the uninstall floor: decide + the two
+    // older floors, nothing else. Re-exported from the bundled copy so it is
+    // otherwise a working engine, not a corrupt one.
+    writeFileSync(
+      join(stale, ".acp", "decide.mjs"),
+      `export { decide, hardlineFloor, destructiveFloor } from ${JSON.stringify(DECIDE)};\n`,
+    );
+    writeFileSync(join(stale, ".acp", "policy.json"), JSON.stringify({ default: "allow", rules: {} }));
+    const out = hook(pre("acp-uninstall"), { HOME: stale, ACP_LOCAL: "1" });
+    assert.equal(out.hookSpecificOutput.permissionDecision, "ask");
+    assert.match(out.hookSpecificOutput.permissionDecisionReason, /uninstall floor/i);
+    // Control: the stale engine still decides an ordinary call locally.
+    const ok = hook(pre("git status"), { HOME: stale, ACP_LOCAL: "1" });
+    assert.notEqual(ok?.hookSpecificOutput?.permissionDecision, "deny");
+  } finally {
+    rmSync(stale, { recursive: true, force: true });
+  }
+});
