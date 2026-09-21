@@ -67,7 +67,7 @@ const ACP_GOVERN =
   process.env.ACP_API_BASE ||
   "https://govern.agenticcontrolplane.com";
 
-const PLUGIN_VERSION = "0.24.0";
+const PLUGIN_VERSION = "0.25.0";
 
 // Console base for user-facing deep links (session receipt, #606).
 const ACP_CONSOLE =
@@ -462,7 +462,10 @@ async function loadEngine() {
   for (const spec of [pathToFileURL(join(ACP_DIR, "decide.mjs")).href, "./decide.mjs"]) {
     try {
       const m = await import(spec);
-      if (typeof m.decide === "function" && typeof m.hardlineFloor === "function" && typeof m.destructiveFloor === "function") return m;
+      // uninstallFloor (gatewaystack-connect#1229) is required too: an
+      // installed copy that predates it is skipped for the bundled one,
+      // so the exit is governed offline before the installer catches up.
+      if (typeof m.decide === "function" && typeof m.hardlineFloor === "function" && typeof m.destructiveFloor === "function" && typeof m.uninstallFloor === "function") return m;
     } catch { /* try the next */ }
   }
   return null;
@@ -514,6 +517,35 @@ function applyOfflineFloors(input, mode) {
       hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: reason },
       systemMessage: reason,
     }));
+    return true;
+  }
+  // Uninstall floor (#1229) — checked before the destructive floor, same
+  // order as decide(), and the reason names what is actually happening
+  // ("removes ACP") instead of the generic shape. This is the branch the
+  // whole floor exists for: an outage or a deleted key is exactly when an
+  // agent-initiated uninstall must still ask, not slide through on
+  // "nothing to check against."
+  const exit = ENGINE.uninstallFloor(input.tool_name, input.tool_input);
+  if (exit) {
+    ledgerRecord(input, { decision: "ask", source: "uninstall-floor", reason: exit, mode });
+    const why = mode === "no-key"
+      ? "ACP has no key on this machine, so nobody can approve it remotely"
+      : "the gateway could not be reached, so nobody can approve it remotely";
+    if (HARNESS === "codex") {
+      const reason = `[ACP] Uninstall floor (${exit}) — ${why}. Codex cannot ask mid-run, so the call is blocked; a human runs it, or run \`acp-uninstall\` yourself in a terminal.`;
+      process.stdout.write(JSON.stringify({
+        hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: reason },
+        systemMessage: reason,
+      }));
+    } else {
+      process.stdout.write(JSON.stringify({
+        hookSpecificOutput: {
+          hookEventName: "PreToolUse",
+          permissionDecision: "ask",
+          permissionDecisionReason: `[ACP] Uninstall floor: ${exit} — ${why}. An agent is trying to remove ACP from this machine. If that's you, approve — or run \`acp-uninstall\` yourself in a terminal.`,
+        },
+      }));
+    }
     return true;
   }
   const soft = ENGINE.destructiveFloor(input.tool_name, input.tool_input, { cwd: input.cwd });
@@ -666,26 +698,20 @@ async function runLocal(input) {
   try {
     policy = JSON.parse(readFileSync(join(ACP_DIR, "policy.json"), "utf8"));
   } catch { /* no/invalid policy → defaults above; the safety floor still applies */ }
-  // The decision engine: prefer the installed copy (~/.acp/decide.mjs, kept
-  // current by the installer), fall back to the copy bundled next to this
-  // file (standalone plugin installs that never ran install.sh).
-  let decide;
-  try {
-    ({ decide } = await import(pathToFileURL(join(ACP_DIR, "decide.mjs")).href));
-  } catch {
-    try {
-      ({ decide } = await import("./decide.mjs"));
-    } catch {
-      // Engine missing/corrupt → never brick, but NEVER silently: say it
-      // loud and leave an audit line, same contract as the cloud path.
-      audit({ ts: new Date().toISOString(), event: "pre", client: ACP_CLIENT, tool: input.tool_name,
-              decision: "allow", source: "fail-open", reason: "local engine unavailable (~/.acp/decide.mjs)" });
-      process.stdout.write(JSON.stringify({
-        systemMessage: "[ACP·local] ⚠ decision engine unavailable (~/.acp/decide.mjs) — this call ran UNGOVERNED and was allowed. Re-run the installer to restore it.",
-      }));
-      return;
-    }
+  // The decision engine is the one loadEngine() already vetted (#1277
+  // MED-6): an installed ~/.acp/decide.mjs that predates uninstallFloor is
+  // skipped for the bundled copy here too, so ACP_LOCAL=1 never runs the
+  // exit through a stale engine. Missing everywhere → never brick, but
+  // NEVER silently: say it loud and leave an audit line.
+  if (!ENGINE) {
+    audit({ ts: new Date().toISOString(), event: "pre", client: ACP_CLIENT, tool: input.tool_name,
+            decision: "allow", source: "fail-open", reason: "local engine unavailable (~/.acp/decide.mjs)" });
+    process.stdout.write(JSON.stringify({
+      systemMessage: "[ACP·local] ⚠ decision engine unavailable (~/.acp/decide.mjs) — this call ran UNGOVERNED and was allowed. Re-run the installer to restore it.",
+    }));
+    return;
   }
+  const { decide } = ENGINE;
   const ctx = await readContext(input);
   const d = decide(input.tool_name, input.tool_input, policy, { ...(ctx || {}), harness: HARNESS, cwd: input.cwd });
   // The ledger mirrors audit.jsonl for local-policy calls so a later connect
