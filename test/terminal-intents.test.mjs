@@ -265,3 +265,65 @@ test("(h) unreachable stub → blocked mentioning ACP was unreachable", async ()
   assert.equal(out.decision, "block");
   assert.match(out.reason, /Couldn't reach ACP/);
 });
+
+// ── #1326 / #1327: held calls, /acp-why, approvals in /acp-status ──────
+
+const HELD_REASON =
+  'approval-requested:0b3c7a52-1111-4000-8000-000000000000 — approvers notified; action blocked until approved. ' +
+  "Review: https://cloud.agenticcontrolplane.com/approvals?id=0b3c7a52-1111-4000-8000-000000000000 " +
+  'A workspace admin decides this one. To keep going, call the acp_wait_approval tool with approval_id "0b3c7a52-1111-4000-8000-000000000000".';
+
+const preToolUse = (overrides = {}) => ({
+  hook_event_name: "PreToolUse",
+  tool_name: "Read",
+  tool_input: { file_path: "/tmp/acp-why-probe.txt" },
+  session_id: "sess-why-1",
+  permission_mode: "default",
+  ...overrides,
+});
+
+test("(g) an admin-decided hold tells the agent to wait, not to hand the step over", async () => {
+  nextResponse = { decision: "deny", reason: HELD_REASON, kind: "delegate" };
+  const out = await runHook(preToolUse());
+  const reason = out?.hookSpecificOutput?.permissionDecisionReason ?? "";
+  assert.equal(out?.hookSpecificOutput?.permissionDecision, "deny");
+  assert.match(reason, /call acp_wait_approval with that approval_id/);
+  assert.ok(!reason.includes("Hand that one step over"), "the generic delegate steer must not contradict the wait");
+});
+
+test("(h) /acp-why explains the last held call from local state, with no request", async () => {
+  nextResponse = { decision: "deny", reason: "denied by interactive tier policy for Bash.rm", kind: "reformulate" };
+  await runHook(preToolUse({ session_id: "sess-why-2", tool_name: "Bash", tool_input: { command: "ls" } }));
+  seen = [];
+  const out = await runHook(expansion({ command_name: "agentic-control-plane:acp-why", session_id: "sess-why-2" }));
+  assert.equal(seen.length, 0, "/acp-why makes no network call");
+  assert.equal(out.decision, "block");
+  assert.match(out.reason, /Last held call \(Bash\)/);
+  assert.match(out.reason, /\/acp-allow Bash\.rm stops holding it/);
+});
+
+test("(i) /acp-why with an approval hold prints the approval link", async () => {
+  nextResponse = { decision: "deny", reason: HELD_REASON, kind: "delegate" };
+  await runHook(preToolUse({ session_id: "sess-why-3" }));
+  const out = await runHook(expansion({ command_name: "agentic-control-plane:acp-why", session_id: "sess-why-3" }));
+  assert.match(out.reason, /Approval: https:\/\/cloud\.agenticcontrolplane\.com\/approvals\?id=0b3c7a52/);
+});
+
+test("(j) /acp-why with nothing held says so", async () => {
+  const out = await runHook(expansion({ command_name: "agentic-control-plane:acp-why", session_id: "sess-never-held" }));
+  assert.match(out.reason, /Nothing has been held in this session/);
+});
+
+test("(k) /acp-status lists each pending approval with its own link", async () => {
+  nextStatusResponse = {
+    ok: true, workspace: "acme", mode: "enforce", rules: [], proposals: [],
+    pendingApprovals: [
+      { id: "a1", tool: "Bash.git-push", channel: "console", review: "https://cloud.agenticcontrolplane.com/approvals?id=a1" },
+      { id: "a2", tool: "Bash.rm", channel: "console", review: "javascript:alert(1)" },
+    ],
+  };
+  const out = await runHook(expansion({ command_name: "agentic-control-plane:acp-status", command_args: "" }));
+  assert.match(out.reason, /Pending approvals \(2\):/);
+  assert.match(out.reason, /Bash\.git-push {2}https:\/\/cloud\.agenticcontrolplane\.com\/approvals\?id=a1/);
+  assert.ok(!out.reason.includes("javascript:"), "only https links are printed");
+});

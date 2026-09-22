@@ -1,6 +1,6 @@
 ---
 name: acp-apply
-description: "Confirm a rule an agent proposed: /acp-apply <proposal id from /acp-status>. You confirm with one tap."
+description: "Confirm a proposed rule (/acp-apply <proposal id from /acp-status>) or switch on a cost lever (/acp-apply context-guard). You confirm with one tap."
 user-invocable: true
 ---
 

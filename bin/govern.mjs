@@ -1147,8 +1147,14 @@ async function handlePreToolUse() {
     reformulate:
       "This refused ONE operation, not your task — continue with everything else. If you believe you should have this capability, call acp_propose_rule (tool, tier, rationale) to draft a rule for a human to approve; it is never applied by you.",
   };
+  // A workspace admin decides this hold, and the gateway told the agent how
+  // to wait for the answer (gatewaystack-connect#1326). The generic
+  // "hand it over" steer would contradict that, so this one wins.
+  const WAIT_STEER =
+    "A workspace admin has to decide this call. Do what the reason says: call acp_wait_approval with that approval_id, retry the identical call only after it reports approved, and stop if it reports denied or timeout. Keep working on anything that does not need this call while you wait.";
   function denyByPolicy(reason, kind) {
-    const steer = STEER_BY_KIND[kind]
+    rememberHeld(reason, kind);
+    const steer = /\bacp_wait_approval\b/.test(reason) ? WAIT_STEER : STEER_BY_KIND[kind]
       || (UNPROPOSABLE.test(reason) ? STEER_BY_KIND.terminal : STEER_BY_KIND.reformulate);
     process.stdout.write(JSON.stringify({
       hookSpecificOutput: {
@@ -1263,6 +1269,7 @@ async function handlePreToolUse() {
     failPostureOnOutage(detail || "network error");
   }
   function ask(reason) {
+    rememberHeld(reason, "ask");
     // Codex has no ask semantic on the wire (see HARNESS note): emit deny
     // with the approval deep link so the human approves out-of-band and
     // the re-run passes under the grant.
@@ -1941,6 +1948,56 @@ function bumpReceiptStats(sessionId, delta) {
   } catch { /* bookkeeping must never touch the call path */ }
 }
 
+// Last held call, for /acp-why (gatewaystack-connect#1327). Kept beside the
+// receipt counters but in its own file: the Stop hook clears the counters
+// every turn, and "why was that blocked?" is usually asked a turn later.
+// Local only, never sent anywhere; pruned with the rest after 7 days.
+function heldPath(sessionId) {
+  const safe = String(sessionId).replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 128);
+  return join(SESSION_STATS_DIR, `${safe}.held.json`);
+}
+
+function rememberHeld(reason, kind) {
+  const sid = input.session_id;
+  if (!sid || sid === "unknown") return;
+  try {
+    mkdirSync(SESSION_STATS_DIR, { recursive: true });
+    writeFileSync(heldPath(sid), JSON.stringify({
+      tool: typeof input.tool_name === "string" ? input.tool_name.slice(0, 80) : "",
+      reason: String(reason ?? "").slice(0, 2000),
+      kind: typeof kind === "string" ? kind : null,
+      at: new Date().toISOString(),
+    }));
+  } catch { /* bookkeeping must never touch the call path */ }
+}
+
+function readHeld(sessionId) {
+  try { return JSON.parse(readFileSync(heldPath(sessionId), "utf8")); } catch { return null; }
+}
+
+/** The lines /acp-why prints: what was held, why, and what changes it. */
+function explainHeld(held) {
+  if (!held || !held.reason) {
+    return "[ACP] Nothing has been held in this session.";
+  }
+  const clean = (v) => String(v ?? "").replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, " ");
+  const lines = [`[ACP] Last held call${held.tool ? ` (${clean(held.tool)})` : ""} at ${clean(held.at)}:`, `  ${clean(held.reason)}`];
+  // Gateway wording: "denied by <tier label> policy for <tool>" and
+  // "step_up by <tier label> policy for <tool>"; the label can hold spaces
+  // and parentheses ("api tier (scoped API key)").
+  const rule = /\b(?:denied|step_up|defer) by [^\n]{1,80}? policy for ([A-Za-z][A-Za-z0-9_.:-]{0,79})/.exec(held.reason);
+  const review = /Review: (https:\/\/\S+)/.exec(held.reason);
+  if (review) lines.push(`Approval: ${review[1]}`);
+  if (rule) {
+    lines.push(`A workspace rule on ${rule[1]} held it. /acp-allow ${rule[1]} stops holding it; /acp-status lists every rule.`);
+  } else if (/^\s*(hardline floor|governance surface|uninstall floor|destructive floor)\b/i.test(held.reason) || held.kind === "terminal") {
+    lines.push("This is a safety floor, not a workspace rule; no command loosens it.");
+  } else {
+    lines.push("/acp-status shows the workspace mode and rules.");
+  }
+  return lines.join("\n");
+}
+
 function clearReceiptStats(sessionId) {
   try { unlinkSync(receiptStatsPath(sessionId)); } catch { /* absent is fine */ }
   try {
@@ -1998,7 +2055,7 @@ function handleStop() {
 // writes to the transcript. That is fine by design: the link executes only
 // the intent the human already typed, as that human, once, inside its TTL
 // — nothing a reader of the transcript can redirect.
-const INTENT_COMMAND_RE = /(?:^|:)acp-(enforce|audit|allow|ask|deny|apply|status)$/;
+const INTENT_COMMAND_RE = /(?:^|:)acp-(enforce|audit|allow|ask|deny|apply|status|why)$/;
 
 function blockExpansion(reason) {
   process.stdout.write(JSON.stringify({ decision: "block", reason }));
@@ -2013,6 +2070,11 @@ async function handleUserPromptExpansion() {
   if (typeof input.agent_id === "string" && input.agent_id) process.exit(0);
   const kind = m[1];
   const target = typeof input.command_args === "string" ? input.command_args.trim().split(/\s+/)[0] || "" : "";
+
+  // /acp-why: local, read-only, no network and no key needed.
+  if (kind === "why") {
+    blockExpansion(explainHeld(readHeld(input.session_id ?? "unknown")));
+  }
 
   if (!token) {
     blockExpansion(`[ACP] Not connected — /acp-${kind} needs a workspace key. Run /acp-connect first.`);
@@ -2033,8 +2095,10 @@ async function handleUserPromptExpansion() {
       const proposals = Array.isArray(s.proposals) && s.proposals.length
         ? "\nProposals waiting for you:\n" + s.proposals.map((p) => `  ${p.id}  ${p.tool} → ${p.permission === "step_up" ? "ask" : p.permission}  (${p.source ?? "agent"})   /acp-apply ${p.id}`).join("\n")
         : "";
+      const link = (v) => (typeof v === "string" && /^https:\/\/\S+$/.test(v) ? v : "");
       const asks = Array.isArray(s.pendingApprovals) && s.pendingApprovals.length
-        ? `\nPending approvals: ${s.pendingApprovals.length} (${ACP_CONSOLE}/approvals)`
+        ? `\nPending approvals (${s.pendingApprovals.length}):\n` + s.pendingApprovals.slice(0, 10).map((a) =>
+            `  ${String(a?.tool ?? "a tool call").replace(/[\u0000-\u001f\u007f]/g, " ").slice(0, 80)}  ${link(a?.review) || `${ACP_CONSOLE}/approvals`}`).join("\n")
         : "";
       // Advice feed (gatewaystack-connect#1325): the top suggestions from
       // your own usage, each with the command that acts on it. Absent when
