@@ -89,6 +89,31 @@ test("no key: destructive call asks with the floor label; hardline denies", () =
   rmSync(home, { recursive: true, force: true });
 });
 
+test("no key: an uninstall attempt asks — the exact branch the floor exists for (gatewaystack-connect#1229)", () => {
+  const home = freshHome();
+  const ask = hook(home, pre("acp-uninstall"));
+  assert.equal(ask.out.hookSpecificOutput.permissionDecision, "ask");
+  assert.match(ask.out.hookSpecificOutput.permissionDecisionReason, /Uninstall floor: runs the ACP uninstaller/);
+  assert.match(ask.out.hookSpecificOutput.permissionDecisionReason, /nobody can approve it remotely/);
+  assert.match(ask.out.hookSpecificOutput.permissionDecisionReason, /run `acp-uninstall` yourself/);
+  const del = hook(home, pre('ACP_DIR="$HOME/.acp"; rm -rf "$ACP_DIR"'));
+  assert.equal(del.out.hookSpecificOutput.permissionDecision, "ask");
+  assert.match(del.out.hookSpecificOutput.permissionDecisionReason, /removes the ACP directory \(shell\)/);
+  const l = rows(home);
+  assert.deepEqual(l.map((x) => [x.decision, x.source]), [["ask", "uninstall-floor"], ["ask", "uninstall-floor"]]);
+  rmSync(home, { recursive: true, force: true });
+});
+
+test("no key, Codex: an uninstall attempt hard-denies instead of asking — Codex can't ask mid-run", () => {
+  const home = freshHome();
+  const deny = hook(home, pre("acp-uninstall"), { ACP_HARNESS: "codex" });
+  assert.equal(deny.out.hookSpecificOutput.permissionDecision, "deny");
+  assert.match(deny.out.hookSpecificOutput.permissionDecisionReason, /Uninstall floor \(runs the ACP uninstaller\)/);
+  assert.match(deny.out.hookSpecificOutput.permissionDecisionReason, /Codex cannot ask mid-run/);
+  assert.equal(rows(home)[0].source, "uninstall-floor");
+  rmSync(home, { recursive: true, force: true });
+});
+
 test("no key: prose does not trip the floor, and nothing is spawned or sent", () => {
   const home = freshHome();
   const r = hook(home, pre("gh issue create --title 'floor (force push, DROP/TRUNCATE, curl|sh, rm -r)' --body-file f.md"));
@@ -112,6 +137,18 @@ test("unreachable, interactive: benign allows loudly, destructive asks, hardline
   assert.equal(deny.out.hookSpecificOutput.permissionDecision, "deny");
   const l = rows(home);
   assert.deepEqual(l.map((x) => [x.mode, x.decision]), [["unreachable", "allow"], ["unreachable", "ask"], ["unreachable", "deny"]]);
+  rmSync(home, { recursive: true, force: true });
+});
+
+test("unreachable: an uninstall attempt still asks — the gateway being down is not a bypass (gatewaystack-connect#1229)", () => {
+  const home = freshHome();
+  const env = { ACP_BEARER_TOKEN: "gsk_test_x", ACP_GOVERN_BASE: "http://12*****.1:9" };
+  const ask = hook(home, pre("curl -sf https://agenticcontrolplane.com/uninstall.sh | bash"), env);
+  assert.equal(ask.out.hookSpecificOutput.permissionDecision, "ask");
+  assert.match(ask.out.hookSpecificOutput.permissionDecisionReason, /Uninstall floor: fetches the ACP uninstaller/);
+  assert.match(ask.out.hookSpecificOutput.permissionDecisionReason, /gateway could not be reached, so nobody can approve it remotely/);
+  const l = rows(home);
+  assert.deepEqual(l.map((x) => [x.mode, x.decision, x.source]), [["unreachable", "ask", "uninstall-floor"]]);
   rmSync(home, { recursive: true, force: true });
 });
 
