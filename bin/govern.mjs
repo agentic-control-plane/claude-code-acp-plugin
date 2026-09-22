@@ -67,7 +67,7 @@ const ACP_GOVERN =
   process.env.ACP_API_BASE ||
   "https://govern.agenticcontrolplane.com";
 
-const PLUGIN_VERSION = "0.25.0";
+const PLUGIN_VERSION = "0.26.0";
 
 // Console base for user-facing deep links (session receipt, #606).
 const ACP_CONSOLE =
@@ -169,7 +169,8 @@ async function readContext(input) {
 // Each client's hooks.json sets this env var at invocation time:
 // "claude-code-plugin", "cursor", "codex", etc. Falls back to
 // claude-code-plugin for backward compat.
-const ACP_CLIENT = process.env.ACP_CLIENT || "claude-code-plugin";
+// `let`, not `const`: a VS Code Copilot call is re-attributed below.
+let ACP_CLIENT = process.env.ACP_CLIENT || "claude-code-plugin";
 
 // Client-side disable for shadow-mode counterfactual notices
 // (gatewaystack-connect#607). The server also honors a tenant-level
@@ -185,6 +186,103 @@ const SHADOW_OFF = /^(off|0|false)$/i.test(process.env.ACP_SHADOW ?? "");
 // (b) skip updatedInput vendor-token injection. The Codex plugin's
 // hooks.json sets ACP_HARNESS=codex.
 const HARNESS = process.env.ACP_HARNESS || "claude-code";
+
+// ── GitHub Copilot: one registration, two dialects ─────────────────────
+// Copilot CLI reads ~/.copilot/hooks/*.json. PascalCase event names in that
+// file select its "VS Code compatible" payload: snake_case fields and a
+// tool_name ALREADY mapped to Claude Code's vocabulary (bash → Bash, view →
+// Read, create → Write, edit → Edit …), so the CLI needs no renaming here.
+// VS Code's agent mode reads the same directory (and ~/.claude/settings.json)
+// but sends its OWN tool ids — run_in_terminal, create_file,
+// replace_string_in_file … — with camelCase inputs (filePath). Every layer
+// that keys on the Claude names (the hardline floor, dotted Bash.* policy,
+// the gateway classifier) would skip those calls silently, so they are
+// canonicalized here, once, before any decision. Exact-match only: a fuzzy
+// rule would put shell-grade policy on some tenant's unrelated custom tool.
+//
+// Output: Copilot CLI documents only the bare {permissionDecision} form for
+// preToolUse; VS Code documents only the hookSpecificOutput wrapper (CLI
+// ≥ 1.0.66 parses the wrapper too). Under ACP_HARNESS=copilot every verdict
+// is written in BOTH shapes — see the stdout mirror below.
+//
+// Ids only VS Code uses. These identify the dialect on ANY registration,
+// because on a box where Claude Code was wired without the plugin, VS Code
+// also runs the ~/.claude/settings.json hook — and that one carries no
+// ACP_HARNESS. Names shared with other dialects (create_file, read_file,
+// list_dir) are renamed but never used as the tell.
+// grep_search, file_search and read_file are NOT tells: Cursor's agent
+// spells its tools the same way, and a tell that matched them would
+// re-attribute a Cursor call and make the Cursor hook stand down.
+const VSCODE_ONLY_TOOLS = new Set([
+  "run_in_terminal", "runTerminalCommand", "replace_string_in_file",
+  "multi_replace_string_in_file", "insert_edit_into_file", "edit_files",
+  "editFiles", "createFile", "runSubagent", "search_subagent",
+  "execution_subagent",
+]);
+const VSCODE_TOOL_ALIASES = {
+  run_in_terminal: "Bash", runTerminalCommand: "Bash",
+  create_file: "Write", createFile: "Write",
+  replace_string_in_file: "Edit", multi_replace_string_in_file: "Edit",
+  insert_edit_into_file: "Edit", edit_files: "Edit", editFiles: "Edit",
+  read_file: "Read",
+  list_dir: "Glob", file_search: "Glob",
+  grep_search: "Grep",
+  fetch_webpage: "WebFetch",
+  runSubagent: "Agent", search_subagent: "Agent", execution_subagent: "Agent",
+};
+const VSCODE_INPUT_KEYS = { filePath: "file_path", oldString: "old_string", newString: "new_string" };
+const COPILOT_REGISTRATION = join(homedir(), ".copilot", "hooks", "acp.json");
+
+function isVsCodeDialect(input) {
+  const name = input?.tool_name;
+  if (typeof name !== "string") return false;
+  if (VSCODE_ONLY_TOOLS.has(name)) return true;
+  const ti = input.tool_input;
+  return name in VSCODE_TOOL_ALIASES && !!ti && typeof ti === "object" && "filePath" in ti;
+}
+
+// Returns false when this process should stand down: the call is VS Code's,
+// it arrived through a registration that is not the Copilot one, and the
+// Copilot registration exists — so that hook is already handling it. One
+// governed call must produce one row, not two.
+function normalizeCopilotInput(input) {
+  if (!input || typeof input !== "object") return true;
+  // Copilot CLI: tool_input is "parsed from JSON string when possible" —
+  // finish the job when it was not. Only under our Copilot registration;
+  // every other harness's payload keeps its shape.
+  if (HARNESS === "copilot" && typeof input.tool_input === "string") {
+    try { input.tool_input = JSON.parse(input.tool_input); } catch { /* leave the string */ }
+  }
+  const vscode = isVsCodeDialect(input);
+  if (vscode && HARNESS !== "copilot" && existsSync(COPILOT_REGISTRATION)) return false;
+  if (vscode) ACP_CLIENT = "copilot-vscode";
+  if (HARNESS !== "copilot" && !vscode) return true;
+  const alias = VSCODE_TOOL_ALIASES[input.tool_name];
+  if (alias) input.tool_name = alias;
+  const ti = input.tool_input;
+  if (ti && typeof ti === "object" && !Array.isArray(ti)) {
+    for (const [from, to] of Object.entries(VSCODE_INPUT_KEYS)) {
+      if (from in ti && !(to in ti)) ti[to] = ti[from];
+    }
+  }
+  return true;
+}
+
+if (HARNESS === "copilot") {
+  const rawWrite = process.stdout.write.bind(process.stdout);
+  process.stdout.write = (chunk, ...rest) => {
+    try {
+      const o = JSON.parse(String(chunk));
+      const h = o && o.hookSpecificOutput;
+      if (h && typeof h.permissionDecision === "string" && o.permissionDecision === undefined) {
+        o.permissionDecision = h.permissionDecision;
+        if (h.permissionDecisionReason !== undefined) o.permissionDecisionReason = h.permissionDecisionReason;
+        return rawWrite(JSON.stringify(o), ...rest);
+      }
+    } catch { /* not one of our JSON verdicts — pass through untouched */ }
+    return rawWrite(chunk, ...rest);
+  };
+}
 
 // 200 KB ceiling on the tool_output payload we send to the backend. Matches
 // the backend's scan ceiling.
@@ -652,6 +750,7 @@ try {
 } catch {
   process.exit(0);
 }
+if (!normalizeCopilotInput(input)) process.exit(0);
 
 // UserPromptExpansion (the /acp-* terminal commands) owns its own
 // no-credential message — "/acp-connect first", not the tool-call floors
@@ -1320,8 +1419,11 @@ async function handlePreToolUse() {
 
   // Codex rejects updatedInput (see HARNESS note) — attempting injection
   // would mark the hook failed and run the tool anyway, minus the token.
-  // Skip cleanly; the local-credential workflow continues unchanged.
-  if (HARNESS === "codex") {
+  // Copilot CLI ignores it (github/copilot-cli#2013) and VS Code drops any
+  // updatedInput that fails its per-tool schema, so the token would be
+  // silently lost. Skip cleanly; the local-credential workflow continues
+  // unchanged.
+  if (HARNESS === "codex" || HARNESS === "copilot") {
     exitAllow();
   }
 
