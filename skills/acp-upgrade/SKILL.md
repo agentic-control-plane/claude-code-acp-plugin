@@ -23,7 +23,7 @@ already fixed upstream.
 1. Run the canonical installer, exactly:
 
    ```bash
-   curl -fsSL https://agenticcontrolplane.com/install.sh | sh
+   curl -sf https://agenticcontrolplane.com/install.sh | bash
    ```
 
    Expect an approval requirement: refreshing the governance hook is
