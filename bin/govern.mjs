@@ -1147,11 +1147,11 @@ async function handlePreToolUse() {
     reformulate:
       "This refused ONE operation, not your task — continue with everything else. If you believe you should have this capability, call acp_propose_rule (tool, tier, rationale) to draft a rule for a human to approve; it is never applied by you.",
   };
-  // A workspace admin decides this hold, and the gateway told the agent how
+  // A human decides this hold outside the terminal, and the gateway told the agent how
   // to wait for the answer (gatewaystack-connect#1326). The generic
   // "hand it over" steer would contradict that, so this one wins.
   const WAIT_STEER =
-    "A workspace admin has to decide this call. Do what the reason says: call acp_wait_approval with that approval_id, retry the identical call only after it reports approved, and stop if it reports denied or timeout. Keep working on anything that does not need this call while you wait.";
+    "This call is decided in the ACP console or from the approval email. Do what the reason says: call acp_wait_approval with that approval_id, retry the identical call only after it reports approved, and stop if it reports denied or timeout. Keep working on anything that does not need this call while you wait.";
   function denyByPolicy(reason, kind) {
     rememberHeld(reason, kind);
     const steer = /\bacp_wait_approval\b/.test(reason) ? WAIT_STEER : STEER_BY_KIND[kind]
