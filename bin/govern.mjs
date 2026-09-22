@@ -67,7 +67,7 @@ const ACP_GOVERN =
   process.env.ACP_API_BASE ||
   "https://govern.agenticcontrolplane.com";
 
-const PLUGIN_VERSION = "0.26.0";
+const PLUGIN_VERSION = "0.27.0";
 
 // Console base for user-facing deep links (session receipt, #606).
 const ACP_CONSOLE =
@@ -2036,10 +2036,20 @@ async function handleUserPromptExpansion() {
       const asks = Array.isArray(s.pendingApprovals) && s.pendingApprovals.length
         ? `\nPending approvals: ${s.pendingApprovals.length} (${ACP_CONSOLE}/approvals)`
         : "";
+      // Advice feed (gatewaystack-connect#1325): the top suggestions from
+      // your own usage, each with the command that acts on it. Absent when
+      // the workspace isn't rolled out or the feed wasn't ready in time.
+      const clean = (v) => String(v ?? "").replace(/[\u0000-\u001f\u007f]/g, " ").slice(0, 300);
+      const advice = Array.isArray(s.advice) && s.advice.length
+        ? "\nSuggestions from your usage:\n" + s.advice.slice(0, 3).map((a) => {
+            const cmd = a && typeof a.command === "string" && a.command ? `\n    → ${clean(a.command)}` : "";
+            return `  • ${clean(a?.line)}${cmd}`;
+          }).join("\n")
+        : "";
       const next = s.mode === "enforce"
         ? "/acp-allow <tool> stops the asking for one tool; /acp-audit records only."
         : "/acp-enforce turns the starter rules on so they ask first.";
-      blockExpansion(`[ACP] ${s.workspace} is in ${s.mode} mode.\nInteractive rules:\n${rules}${proposals}${asks}\n${next}`);
+      blockExpansion(`[ACP] ${s.workspace} is in ${s.mode} mode.\nInteractive rules:\n${rules}${proposals}${asks}${advice}\n${next}`);
     }
 
     const res = await fetch(`${ACP_API}/plugin/intents`, {

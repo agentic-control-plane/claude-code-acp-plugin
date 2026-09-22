@@ -196,6 +196,30 @@ test("(c) /acp-status reads GET /plugin/intents/status and lists the mode + a pr
   assert.ok(out.reason.includes("/acp-apply p1"), "reason should include the apply hint for proposal p1");
 });
 
+test("(c2) /acp-status prints the advice feed with each item's command, and omits the section when absent", async () => {
+  nextStatusResponse = {
+    ok: true,
+    workspace: "acme",
+    mode: "enforce",
+    rules: [],
+    proposals: [],
+    pendingApprovals: [],
+    advice: [
+      { id: "policy:auto_allow:Bash.git-push", line: "You approved Bash.git-push 6 times this month and never said no.", command: "/acp-allow Bash.git-push", commandKind: "acp", impactUsd: null },
+      { id: "cost:cache_economics:x", line: "x pays full price for most of its input.\u001b[31m", command: null, commandKind: null, impactUsd: 90 },
+    ],
+  };
+  const out = await runHook(expansion({ command_name: "agentic-control-plane:acp-status", command_args: "" }));
+  assert.ok(out.reason.includes("Suggestions from your usage:"));
+  assert.ok(out.reason.includes("→ /acp-allow Bash.git-push"));
+  assert.ok(out.reason.includes("pays full price"));
+  assert.ok(!out.reason.includes("\u001b"), "control characters from the gateway are stripped");
+
+  nextStatusResponse = { ok: true, workspace: "acme", mode: "audit", rules: [], proposals: [], pendingApprovals: [] };
+  const plain = await runHook(expansion({ command_name: "agentic-control-plane:acp-status", command_args: "" }));
+  assert.ok(!plain.reason.includes("Suggestions"));
+});
+
 test("(d) a non-ACP command never triggers a request or any output", async () => {
   const out = await runHook(expansion({ command_name: "probe:enforce" }));
   assert.equal(out, null);
