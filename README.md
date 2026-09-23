@@ -73,7 +73,7 @@ Not every step_up has to end at a console link. When a workspace rule says ask a
 
 ### Commands
 
-Type `/acp-status`, `/acp-enforce`, `/acp-audit`, `/acp-allow <tool>`, `/acp-ask <tool>`, `/acp-deny <tool>`, or `/acp-apply <proposal>` in the terminal to check or change how your workspace is governed without leaving the session. The hook files exactly what you typed and prints a link back — nothing changes until you open it and tap Confirm, so a stray or injected command can't move policy on its own. A confirmed change applies to the whole workspace, the same as making it in the console; if you're not an admin, your request is filed for one to review.
+Type `/acp-status`, `/acp-enforce`, `/acp-audit`, `/acp-allow <tool>`, `/acp-ask <tool>`, `/acp-deny <tool>`, `/acp-apply <proposal>` or `/acp-apply context-guard` in the terminal to check or change how your workspace is governed without leaving the session. `/acp-status` also lists suggestions from your own usage and every approval waiting on someone, each with its link. `/acp-why` explains the last call ACP held in this session, locally, with no network call. The hook files exactly what you typed and prints a link back — nothing changes until you open it and tap Confirm, so a stray or injected command can't move policy on its own. A confirmed change applies to the whole workspace, the same as making it in the console; if you're not an admin, your request is filed for one to review.
 
 ### Context guard (v0.15.0+, off by default)
 
