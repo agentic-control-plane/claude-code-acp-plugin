@@ -67,7 +67,7 @@ const ACP_GOVERN =
   process.env.ACP_API_BASE ||
   "https://govern.agenticcontrolplane.com";
 
-const PLUGIN_VERSION = "0.27.0";
+const PLUGIN_VERSION = "0.28.0";
 
 // Console base for user-facing deep links (session receipt, #606).
 const ACP_CONSOLE =
@@ -287,6 +287,15 @@ if (HARNESS === "copilot") {
 // 200 KB ceiling on the tool_output payload we send to the backend. Matches
 // the backend's scan ceiling.
 const POST_HOOK_PAYLOAD_CEILING = 200 * 1024;
+
+// Strip control/bidi-override characters from any gateway-supplied free
+// text before it reaches a terminal (approval_summary, agent_notice,
+// catch_up, upgrade_notice, …). Same character class the existing /acp-why
+// and /acp-status renderers already use inline — centralized here for new
+// code so it is applied consistently.
+function stripControl(v) {
+  return String(v ?? "").replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f‪-‮⁦-⁩]/g, " ");
+}
 
 // Hostname-only form of ACP_API for env-var injection (e.g. GH_HOST).
 // gh CLI accepts hostnames, not URLs — strip protocol + trailing slash.
@@ -954,6 +963,10 @@ function firstTierNoticeThisSession() {
  * lives in lib/staleNotice.mjs for the test suite — keep both in sync. */
 const STALE_NOTICE_MARKER = join(ACP_DIR, ".stale-notice");
 const STALE_NOTICE_TTL_MS = 24 * 60 * 60 * 1000;
+// #1351 upgrade_notice: same "at most once per TTL" marker pattern, its own
+// file so it dedupes independently of the stale-hook-version notice above.
+const UPGRADE_NOTICE_MARKER = join(ACP_DIR, ".upgrade-notice");
+const UPGRADE_NOTICE_TTL_MS = 24 * 60 * 60 * 1000;
 
 function parseSemver(v) {
   if (typeof v !== "string") return null;
@@ -1152,8 +1165,10 @@ async function handlePreToolUse() {
   // "hand it over" steer would contradict that, so this one wins.
   const WAIT_STEER =
     "This call is decided in the ACP console or from the approval email. Do what the reason says: call acp_wait_approval with that approval_id, retry the identical call only after it reports approved, and stop if it reports denied or timeout. Keep working on anything that does not need this call while you wait.";
-  function denyByPolicy(reason, kind) {
+  function denyByPolicy(reason, kind, verdict) {
     rememberHeld(reason, kind);
+    rememberPendingApproval(approvalMeta(verdict));
+    bumpTurnHeld();
     const steer = /\bacp_wait_approval\b/.test(reason) ? WAIT_STEER : STEER_BY_KIND[kind]
       || (UNPROPOSABLE.test(reason) ? STEER_BY_KIND.terminal : STEER_BY_KIND.reformulate);
     process.stdout.write(JSON.stringify({
@@ -1162,7 +1177,7 @@ async function handlePreToolUse() {
         permissionDecision: "deny",
         permissionDecisionReason: `[ACP] Denied by policy: ${reason}\n\n${steer}`,
       },
-      systemMessage: `[ACP] Denied by policy: ${reason}`,
+      systemMessage: [recoveryLine, `[ACP] Denied by policy: ${reason}`].filter(Boolean).join("\n"),
     }));
     process.exit(0);
   }
@@ -1189,9 +1204,20 @@ async function handlePreToolUse() {
       // Queue the lapse for the session's next PostToolUse (#902) so the
       // gateway gets a row for the call it never saw.
       recordPendingLapse(input.session_id, input.tool_name, detail);
+      // UNGOVERNED banner (#1352 part 3): loud once at the START of an
+      // outage, silent for every call while it continues — the recovery
+      // line (below, keyed off the same local file) says how many ran
+      // unchecked when the gateway answers again. Scoped to the
+      // interactive fail-open branch only: the unattended fail-closed path
+      // below already blocks and already logs, so there is nothing to
+      // dedupe there.
+      const outageState = markOutageCall();
+      const firstOfOutage = !outageState || outageState.calls <= 1;
       process.stdout.write(JSON.stringify({
         hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "allow" },
-        systemMessage: `[ACP] ⚠ UNGOVERNED: gateway unreachable (${detail}) — call proceeded WITHOUT policy check. Lapse logged to ~/.acp/lapse.log and queued for this session's next governed call.`,
+        ...(firstOfOutage
+          ? { systemMessage: `[ACP] ⚠ UNGOVERNED: gateway unreachable (${detail}) — call proceeded WITHOUT policy check. Lapse logged to ~/.acp/lapse.log and queued for this session's next governed call.` }
+          : {}),
       }));
       process.exit(0);
     }
@@ -1268,8 +1294,10 @@ async function handlePreToolUse() {
   function denyUnreachable(detail) {
     failPostureOnOutage(detail || "network error");
   }
-  function ask(reason) {
+  function ask(reason, verdict) {
     rememberHeld(reason, "ask");
+    rememberPendingApproval(approvalMeta(verdict));
+    bumpTurnHeld();
     // Codex has no ask semantic on the wire (see HARNESS note): emit deny
     // with the approval deep link so the human approves out-of-band and
     // the re-run passes under the grant.
@@ -1285,7 +1313,7 @@ async function handlePreToolUse() {
         permissionDecision: decision,
         permissionDecisionReason: `[ACP] Approval required: ${reason}\n\n${steer}`,
       },
-      systemMessage: `[ACP] Approval required: ${reason}`,
+      systemMessage: [recoveryLine, `[ACP] Approval required: ${reason}`].filter(Boolean).join("\n"),
     }));
     process.exit(0);
   }
@@ -1322,6 +1350,11 @@ async function handlePreToolUse() {
 
   let policyAllowed = true;
   let tierNotice = null;
+  // Recovery line (#1352 part 3): set the moment the gateway answers with a
+  // real verdict (2xx, or a 4xx that carries one) after an outage was in
+  // progress; threaded into whichever of denyByPolicy/ask/exitAllow fires
+  // next so a hook run still writes exactly one stdout object.
+  let recoveryLine = null;
   // Stale-hook line (see staleHookNotice): rides the allow funnel below,
   // and reaches stderr on every decision including denies.
   let staleNotice = null;
@@ -1353,12 +1386,15 @@ async function handlePreToolUse() {
       // 4xx (e.g. the auth guard's 401) keep the outage posture.
       if (res.status >= 400 && res.status < 500) {
         const verdict = await res.json().catch(() => null);
+        if (verdict && (verdict.decision === "deny" || verdict.decision === "ask")) {
+          recoveryLine = checkOutageRecovery();
+        }
         if (verdict && verdict.decision === "deny") {
-          denyByPolicy(verdict.reason || `denied (HTTP ${res.status})`, verdict.kind);
+          denyByPolicy(verdict.reason || `denied (HTTP ${res.status})`, verdict.kind, verdict);
           return;
         }
         if (verdict && verdict.decision === "ask") {
-          ask(verdict.reason || "approval required");
+          ask(verdict.reason || "approval required", verdict);
           return;
         }
       }
@@ -1367,12 +1403,13 @@ async function handlePreToolUse() {
     }
     const data = await res.json();
     staleNotice = staleHookNotice(res, data);
+    recoveryLine = checkOutageRecovery();
     if (data.decision === "deny") {
-      denyByPolicy(data.reason || "policy did not return a reason", data.kind);
+      denyByPolicy(data.reason || "policy did not return a reason", data.kind, data);
       return;
     }
     if (data.decision === "ask") {
-      ask(data.reason || "approval required");
+      ask(data.reason || "approval required", data);
       return;
     }
     // decision is allow (or unspecified) — continue to step 2.
@@ -1403,7 +1440,7 @@ async function handlePreToolUse() {
   // session's marker), so the result is memoized for any second read.
   let unpricedNotice;
   function allowSystemMessage() {
-    const parts = [tierNotice, wireWarning, staleNotice].filter((s) => typeof s === "string" && s.trim());
+    const parts = [recoveryLine, tierNotice, wireWarning, staleNotice].filter((s) => typeof s === "string" && s.trim());
     if (unpricedNotice === undefined) unpricedNotice = claimUnpricedNotice();
     if (unpricedNotice) parts.push(unpricedNotice);
     return parts.length ? parts.join(" ") : null;
@@ -1779,31 +1816,61 @@ async function handlePostToolUse() {
     // Receipt bookkeeping (#606): one governed call, plus what ACP said
     // about it. Counted only on a real server verdict — a call the
     // gateway never saw is not claimed as governed.
-    const noticed = !SHADOW_OFF && typeof data.notice === "string" && data.notice.trim() !== "";
+    const flagged = data.action === "redact" || data.action === "block";
+    const isShadow = !SHADOW_OFF && typeof data.notice === "string" && data.notice.trim() !== "";
+    // notice_lever marks a "cost" lever notice (#1349/#1350 part 1:
+    // expensive_run, context_threshold, tool_output_bloat, repeat_approval,
+    // ...); a notice with no lever is the older shadow-mode counterfactual.
+    // Both use the same `notice` text on the human channel — this only
+    // decides which per-turn bucket it counts against for the Stop line.
+    const hasLever = typeof data.notice_lever === "string" && data.notice_lever.trim() !== "";
+    const noticed = isShadow;
     bumpReceiptStats(input.session_id, {
       calls: 1,
-      flagged: data.action === "redact" || data.action === "block" ? 1 : 0,
+      flagged: flagged ? 1 : 0,
       notices: noticed ? 1 : 0,
+    });
+    bumpTurnStats(input.session_id, {
+      flagged: flagged ? 1 : 0,
+      shadow: noticed && !hasLever ? 1 : 0,
+      cost: noticed && hasLever ? 1 : 0,
     });
     // Stale-hook line: appended to whatever this event already says, never
     // replacing it; a hook run writes at most ONE stdout JSON object.
     const staleNotice = staleHookNotice(res, data);
     const withStale = (msg) => (staleNotice ? `${msg} ${staleNotice}` : msg);
-    if (data.action === "redact" || data.action === "block") {
-      process.stdout.write(JSON.stringify({
-        systemMessage: withStale(`[ACP] ${data.action === "block" ? "Blocked" : "Flagged"}: ${data.reason || "governance policy"}`),
-      }));
-    } else if (!SHADOW_OFF && typeof data.notice === "string" && data.notice.trim()) {
-      // Shadow-mode counterfactual (gatewaystack-connect#607): the server
-      // sends a fully-formed "[ACP shadow] …" line for audit-mode tenants —
-      // what enforcement WOULD have done to the call that just ran. It is
-      // advisory only and arrives with action "pass"; frequency caps are
-      // server-side. ACP_SHADOW=off is the client-side belt to the server's
-      // suspenders (the tenant-level shadowNotices:false disable).
-      process.stdout.write(JSON.stringify({ systemMessage: withStale(data.notice) }));
+    const sysParts = [];
+    if (flagged) {
+      sysParts.push(withStale(`[ACP] ${data.action === "block" ? "Blocked" : "Flagged"}: ${data.reason || "governance policy"}`));
+    } else if (isShadow) {
+      // Shadow-mode counterfactual (gatewaystack-connect#607) / lever notice
+      // (#1349): the server sends a fully-formed human line for audit-mode
+      // tenants or a specific cost/behavior lever. Advisory only; frequency
+      // caps are server-side. ACP_SHADOW=off is the client-side belt to the
+      // server's suspenders (the tenant-level shadowNotices:false disable).
+      sysParts.push(withStale(data.notice));
     } else if (staleNotice) {
-      process.stdout.write(JSON.stringify({ systemMessage: staleNotice }));
+      sysParts.push(staleNotice);
     }
+    // agent_notice (#1349): model-facing only, for levers the model can act
+    // on itself. `notice` (above) stays human-only and unchanged.
+    const agentNotice = typeof data.agent_notice === "string" && data.agent_notice.trim()
+      ? stripControl(data.agent_notice).trim()
+      : null;
+    const out = {};
+    if (sysParts.length) out.systemMessage = sysParts.join(" ");
+    if (agentNotice) {
+      if (HARNESS === "claude-code") {
+        out.hookSpecificOutput = { hookEventName: "PostToolUse", additionalContext: agentNotice };
+      } else {
+        // Codex only honors additionalContext on SessionStart; Copilot's
+        // support for it here is unconfirmed. Fold into the human channel
+        // instead of dropping it, joined onto whatever systemMessage this
+        // call already has.
+        out.systemMessage = out.systemMessage ? `${out.systemMessage} ${agentNotice}` : agentNotice;
+      }
+    }
+    if (out.systemMessage || out.hookSpecificOutput) process.stdout.write(JSON.stringify(out));
   } catch {
     // silent pass-through for the verdict; the usage batch is retried next
     // time (a 2xx whose body failed to parse was already acked above).
@@ -1893,18 +1960,38 @@ async function handleSessionStart() {
     // latestVersion / minGoodVersion. Appended to the upgrade notice when
     // both are present, never replacing it.
     const staleNotice = staleHookNotice(res, data);
-    const upgradeNotice = data && typeof data.notice === "string" && data.notice.trim() ? data.notice.trim() : null;
+    // #1351's upgrade_notice (human-worded, ends "/acp-upgrade") supersedes
+    // the older model-facing `data.notice` upgrade text per CONTRACT.md §4:
+    // when present, it is shown to the human only, at most once per 24h
+    // per machine, and the older text is NOT also forwarded to the model.
+    const newUpgrade = data && typeof data.upgrade_notice === "string" && data.upgrade_notice.trim()
+      ? data.upgrade_notice.trim()
+      : null;
+    const upgradeNotice = !newUpgrade && data && typeof data.notice === "string" && data.notice.trim()
+      ? data.notice.trim()
+      : null;
     const context = [upgradeNotice, staleNotice].filter(Boolean).join("\n");
-    if (context) {
+    // catch_up (#1351): one human line since this user's previous session
+    // start. Shown every SessionStart it's present on — the gateway itself
+    // bounds how often it has anything to say (cap 7 days, ≥60s cache).
+    const catchUp = data && typeof data.catch_up === "string" && data.catch_up.trim()
+      ? stripControl(data.catch_up).trim()
+      : null;
+    const upgradeOnce = newUpgrade && shouldNoticeNow({ markerPath: UPGRADE_NOTICE_MARKER, ttlMs: UPGRADE_NOTICE_TTL_MS })
+      ? newUpgrade
+      : null;
+    const sysMessage = [catchUp, upgradeOnce, offer].filter(Boolean).join("\n") || null;
+    if (context && sysMessage) {
       process.stdout.write(JSON.stringify({
-        hookSpecificOutput: {
-          hookEventName: "SessionStart",
-          additionalContext: context,
-        },
-        ...(offer ? { systemMessage: offer } : {}),
+        hookSpecificOutput: { hookEventName: "SessionStart", additionalContext: context },
+        systemMessage: sysMessage,
       }));
-    } else if (offer) {
-      process.stdout.write(JSON.stringify({ systemMessage: offer }));
+    } else if (context) {
+      process.stdout.write(JSON.stringify({
+        hookSpecificOutput: { hookEventName: "SessionStart", additionalContext: context },
+      }));
+    } else if (sysMessage) {
+      process.stdout.write(JSON.stringify({ systemMessage: sysMessage }));
     }
   } catch {
     // silent — absence of attestation is visible server-side by design
@@ -1998,6 +2085,237 @@ function explainHeld(held) {
   return lines.join("\n");
 }
 
+/* ── Pending approvals list (#1346/#1348/#1350): the local half of the
+ * held-call bookkeeping /acp-approve and UserPromptSubmit read. Separate
+ * from heldPath/rememberHeld above (which /acp-why owns and which only
+ * ever remembers the LAST held call) because a session can have several
+ * approval-workflow holds outstanding at once. Best-effort, local only,
+ * pruned by clearReceiptStats's directory sweep at SessionEnd like every
+ * other file under SESSION_STATS_DIR. ── */
+function pendingPath(sessionId) {
+  const safe = String(sessionId).replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 128);
+  return join(SESSION_STATS_DIR, `${safe}.pending.json`);
+}
+
+function readPending(sessionId) {
+  try {
+    const raw = JSON.parse(readFileSync(pendingPath(sessionId), "utf8"));
+    return Array.isArray(raw) ? raw : [];
+  } catch {
+    return [];
+  }
+}
+
+function writePending(sessionId, list) {
+  if (!sessionId || sessionId === "unknown") return;
+  try {
+    mkdirSync(SESSION_STATS_DIR, { recursive: true });
+    writeFileSync(pendingPath(sessionId), JSON.stringify(Array.isArray(list) ? list.slice(-20) : []));
+  } catch { /* bookkeeping must never touch the call path */ }
+}
+
+// Pulls the new optional approval_* fields (CONTRACT.md §1) off a deny/ask
+// verdict. Returns null when the verdict carries no approval_id — a
+// fatigue-cap deny, a plain rule deny, or a gateway older than this field
+// all fall through here silently.
+function approvalMeta(verdict) {
+  if (!verdict || typeof verdict !== "object") return null;
+  const id = typeof verdict.approval_id === "string" && verdict.approval_id ? verdict.approval_id : null;
+  if (!id) return null;
+  const code = typeof verdict.approval_code === "string" && verdict.approval_code
+    ? verdict.approval_code
+    : id.replace(/[^0-9a-fA-F]/g, "").slice(0, 4).toUpperCase();
+  return {
+    id,
+    code,
+    url: typeof verdict.approval_url === "string" && verdict.approval_url ? verdict.approval_url : null,
+    summary: typeof verdict.approval_summary === "string" && verdict.approval_summary
+      ? stripControl(verdict.approval_summary).slice(0, 90)
+      : null,
+  };
+}
+
+// Records (or refreshes) one pending approval for this session. Called from
+// both denyByPolicy and ask — coalescing on the gateway side means repeat
+// holds for the same request arrive with the same approval_id, so this
+// keeps one row per id rather than growing without bound.
+function rememberPendingApproval(meta) {
+  if (!meta) return;
+  const sid = input.session_id;
+  if (!sid || sid === "unknown") return;
+  try {
+    const list = readPending(sid).filter((e) => e && e.id !== meta.id);
+    list.push({
+      id: meta.id,
+      code: meta.code,
+      url: meta.url,
+      summary: meta.summary,
+      status: "pending",
+      notified: false,
+      at: new Date().toISOString(),
+    });
+    writePending(sid, list);
+  } catch { /* bookkeeping must never touch the call path */ }
+}
+
+// ≤10 ids, ≤ timeoutMs, silent on any failure — the shared fetch behind
+// both UserPromptSubmit's poll and /acp-approve's refresh. Returns a Map
+// keyed by approval id; empty on any failure (network, timeout, non-2xx,
+// malformed body).
+async function refreshApprovals(ids, timeoutMs) {
+  const list = Array.isArray(ids) ? ids.filter((x) => typeof x === "string" && x).slice(0, 10) : [];
+  if (!list.length || !token) return new Map();
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(`${ACP_API}/plugin/intents/approvals?ids=${encodeURIComponent(list.join(","))}`, {
+      method: "GET",
+      headers,
+      signal: controller.signal,
+    });
+    if (!res.ok) return new Map();
+    const body = await res.json().catch(() => null);
+    const approvals = Array.isArray(body?.approvals) ? body.approvals : [];
+    return new Map(approvals.filter((a) => a && typeof a.id === "string").map((a) => [a.id, a]));
+  } catch {
+    return new Map();
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Merges a refreshApprovals() Map onto locally-held pending entries. Marks
+// `notified` on any entry that has left "pending" so a later /acp-approve
+// read (or the next UserPromptSubmit poll) does not re-announce it.
+function mergeApprovalUpdates(entries, fresh) {
+  return entries.map((e) => {
+    const a = fresh.get(e.id);
+    if (!a) return e;
+    const status = typeof a.status === "string" ? a.status : e.status;
+    if (status === e.status) return e;
+    return { ...e, status, code: typeof a.code === "string" && a.code ? a.code : e.code, notified: status !== "pending" ? true : e.notified };
+  });
+}
+
+function ageString(iso) {
+  const ms = Date.now() - new Date(iso).getTime();
+  if (!Number.isFinite(ms) || ms < 0) return "";
+  const mins = Math.round(ms / 60000);
+  if (mins < 1) return "just now";
+  if (mins < 60) return `${mins}m`;
+  return `${Math.round(mins / 60)}h`;
+}
+
+function describeApproval(e) {
+  const age = e.at ? ageString(e.at) : "";
+  const summary = e.summary ? stripControl(e.summary) : (e.tool || "a tool call");
+  const url = e.url || `${ACP_CONSOLE}/approvals`;
+  return `ACP-${e.code}  ${summary}${age ? `  (${age})` : ""}  ${url}`;
+}
+
+/* ── Per-turn receipt counters (#1348): reset every Stop, unlike the
+ * cumulative session totals in receiptStatsPath (reset only at
+ * SessionEnd). `held` is bumped directly from denyByPolicy/ask, since a
+ * held call never reaches PostToolUse. ── */
+function turnStatsPath(sessionId) {
+  const safe = String(sessionId).replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 128);
+  return join(SESSION_STATS_DIR, `${safe}.turn.json`);
+}
+
+function readTurnStats(sessionId) {
+  try {
+    const raw = JSON.parse(readFileSync(turnStatsPath(sessionId), "utf8"));
+    return {
+      calls: Number(raw.calls) || 0,
+      flagged: Number(raw.flagged) || 0,
+      shadow: Number(raw.shadow) || 0,
+      cost: Number(raw.cost) || 0,
+      held: Number(raw.held) || 0,
+    };
+  } catch {
+    return { calls: 0, flagged: 0, shadow: 0, cost: 0, held: 0 };
+  }
+}
+
+function bumpTurnStats(sessionId, delta) {
+  if (!sessionId || sessionId === "unknown") return;
+  try {
+    mkdirSync(SESSION_STATS_DIR, { recursive: true });
+    const cur = readTurnStats(sessionId);
+    writeFileSync(turnStatsPath(sessionId), JSON.stringify({
+      calls: cur.calls + (delta.calls ?? 0),
+      flagged: cur.flagged + (delta.flagged ?? 0),
+      shadow: cur.shadow + (delta.shadow ?? 0),
+      cost: cur.cost + (delta.cost ?? 0),
+      held: cur.held + (delta.held ?? 0),
+    }));
+  } catch { /* bookkeeping must never touch the call path */ }
+}
+
+function clearTurnStats(sessionId) {
+  try { unlinkSync(turnStatsPath(sessionId)); } catch { /* absent is fine */ }
+}
+
+function bumpTurnHeld() {
+  bumpTurnStats(input.session_id, { held: 1 });
+}
+
+/* ── UNGOVERNED outage dedup (#1352 part 3) ──
+ * Scoped only to failPostureOnOutage's interactive fail-open branch: the
+ * unattended fail-closed branch already blocks and already logs every
+ * call, and the separate no-credentials / key-rejected banners are a
+ * different failure category with their own once-per-session dedupe. */
+const OUTAGE_STATE_PATH = join(ACP_DIR, "outage-state.json");
+
+function readOutageState() {
+  try {
+    const raw = JSON.parse(readFileSync(OUTAGE_STATE_PATH, "utf8"));
+    return raw && typeof raw === "object" ? raw : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeOutageState(state) {
+  try {
+    mkdirSync(ACP_DIR, { recursive: true });
+    writeFileSync(OUTAGE_STATE_PATH, JSON.stringify(state));
+  } catch { /* bookkeeping must never touch the call path */ }
+}
+
+function clearOutageState() {
+  try { unlinkSync(OUTAGE_STATE_PATH); } catch { /* absent is fine */ }
+}
+
+// Called on every interactive fail-open lapse; returns the updated state
+// (or null on a write failure, treated as "first of outage" by the caller
+// so the banner still fires rather than going silently missing).
+function markOutageCall() {
+  try {
+    const cur = readOutageState() || { since: new Date().toISOString(), calls: 0 };
+    cur.calls = (Number(cur.calls) || 0) + 1;
+    writeOutageState(cur);
+    return cur;
+  } catch {
+    return null;
+  }
+}
+
+// Called whenever the gateway answers with a real verdict. If an outage was
+// recorded, clears it and returns the human-facing recovery line; else
+// null. Never throws, never blocks.
+function checkOutageRecovery() {
+  try {
+    const state = readOutageState();
+    if (!state || !state.calls) return null;
+    clearOutageState();
+    const n = Number(state.calls) || 0;
+    return `[ACP] Governed again; ${n} call${n === 1 ? "" : "s"} ran unchecked, logged to ~/.acp/lapse.log.`;
+  } catch {
+    return null;
+  }
+}
+
 function clearReceiptStats(sessionId) {
   try { unlinkSync(receiptStatsPath(sessionId)); } catch { /* absent is fine */ }
   try {
@@ -2021,20 +2339,56 @@ function buildReceiptLine(stats, sessionId) {
   return `[ACP] Session receipt: ${parts.join(" · ")} — review this session: ${ACP_CONSOLE}/sessions/${encodeURIComponent(String(sessionId))}${next}`;
 }
 
-// One line at session end: what ACP governed, anything it said, and a
-// deep link to THIS session's timeline. Purely local (reads the counters
-// PostToolUse kept) — no network, no latency, silent when the session
-// used no tools. The counters are cleared so a resumed session starts a
-// fresh receipt, and stale files from crashed sessions are pruned.
+// Per-turn line (#1348): fires on Stop, which in Claude Code is every
+// assistant turn — NOT session end. Silent unless this turn actually did
+// something (a held call, a flag, a shadow notice or a cost notice) or
+// there are held calls still waiting from an earlier turn. Only the turn
+// window is cleared here; the cumulative session totals (receiptStatsPath)
+// now live until handleSessionEnd, so a long session's real receipt is not
+// lost to the very first Stop.
 function handleStop() {
   // stop_hook_active means WE are inside a stop-hook continuation —
   // never loop or double-print the receipt.
   if (input.stop_hook_active) process.exit(0);
+  const sid = input.session_id ?? "unknown";
   try {
-    const msg = buildReceiptLine(readReceiptStats(input.session_id ?? "unknown"), input.session_id ?? "unknown");
+    const turn = readTurnStats(sid);
+    const pending = readPending(sid).filter((e) => e && e.status === "pending");
+    const parts = [];
+    if (turn.held || turn.flagged || turn.shadow || turn.cost) {
+      const bits = [];
+      if (turn.held) bits.push(`${turn.held} held`);
+      if (turn.flagged) bits.push(`${turn.flagged} flagged`);
+      if (turn.shadow) bits.push(`${turn.shadow} shadow notice${turn.shadow === 1 ? "" : "s"}`);
+      if (turn.cost) bits.push(`${turn.cost} cost notice${turn.cost === 1 ? "" : "s"}`);
+      parts.push(`[ACP] This turn: ${bits.join(", ")}.`);
+    }
+    if (pending.length) {
+      const lines = pending.slice(0, 5).map((e) => `  ${describeApproval(e)}`);
+      parts.push(`[ACP] Still pending approval (/acp-approve):\n${lines.join("\n")}`);
+    }
+    if (parts.length) process.stdout.write(JSON.stringify({ systemMessage: parts.join("\n") }));
+  } catch { /* a receipt failure must never disturb the turn */ }
+  clearTurnStats(sid);
+  process.exit(0);
+}
+
+// Real totals receipt on the harness session-end event (#1348): what ACP
+// governed this session, anything it said, and a deep link to THIS
+// session's timeline. Purely local (reads the counters PostToolUse kept)
+// — no network, no latency, silent when the session used no tools.
+// Cumulative counters, the turn window and the pending-approvals list are
+// all cleared here so a resumed session starts a fresh receipt; stale
+// files from crashed sessions are pruned by the same sweep.
+function handleSessionEnd() {
+  const sid = input.session_id ?? "unknown";
+  try {
+    const msg = buildReceiptLine(readReceiptStats(sid), sid);
     if (msg) process.stdout.write(JSON.stringify({ systemMessage: msg }));
   } catch { /* a receipt failure must never disturb session end */ }
-  clearReceiptStats(input.session_id ?? "unknown");
+  clearReceiptStats(sid);
+  clearTurnStats(sid);
+  try { unlinkSync(pendingPath(sid)); } catch { /* absent is fine */ }
   process.exit(0);
 }
 
@@ -2055,7 +2409,7 @@ function handleStop() {
 // writes to the transcript. That is fine by design: the link executes only
 // the intent the human already typed, as that human, once, inside its TTL
 // — nothing a reader of the transcript can redirect.
-const INTENT_COMMAND_RE = /(?:^|:)acp-(enforce|audit|allow|ask|deny|apply|status|why)$/;
+const INTENT_COMMAND_RE = /(?:^|:)acp-(enforce|audit|allow|ask|deny|apply|status|why|approve)$/;
 
 function blockExpansion(reason) {
   process.stdout.write(JSON.stringify({ decision: "block", reason }));
@@ -2074,6 +2428,36 @@ async function handleUserPromptExpansion() {
   // /acp-why: local, read-only, no network and no key needed.
   if (kind === "why") {
     blockExpansion(explainHeld(readHeld(input.session_id ?? "unknown")));
+  }
+
+  // /acp-approve [code]: local-first, like /acp-why — the pending list was
+  // already recorded on this machine when the call was held. With a token
+  // it also takes one best-effort refresh so a code approved from the
+  // console shows as approved here without waiting for the next prompt's
+  // UserPromptSubmit poll. Never approves anything itself (#1346 §1) — the
+  // console page does that, under its own auth.
+  if (kind === "approve") {
+    const sid = input.session_id ?? "unknown";
+    let list = readPending(sid);
+    if (token) {
+      const ids = list.filter((e) => e.status === "pending").map((e) => e.id);
+      if (ids.length) {
+        const fresh = await refreshApprovals(ids, 4000);
+        if (fresh.size) {
+          list = mergeApprovalUpdates(list, fresh);
+          writePending(sid, list);
+        }
+      }
+    }
+    const pending = list.filter((e) => e.status === "pending");
+    const wanted = target.replace(/^ACP-/i, "").toLowerCase();
+    const filtered = target ? pending.filter((e) => String(e.code).toLowerCase() === wanted) : pending;
+    if (!filtered.length) {
+      blockExpansion(target
+        ? `[ACP] No pending held call matches "${target}" in this session.`
+        : `[ACP] Nothing held for approval in this session.`);
+    }
+    blockExpansion(`[ACP] Held, waiting for approval:\n${filtered.map((e) => `  ${describeApproval(e)}`).join("\n")}`);
   }
 
   if (!token) {
@@ -2142,9 +2526,51 @@ async function handleUserPromptExpansion() {
   }
 }
 
+/* ------------------------------------------------------------------ */
+/* UserPromptSubmit — approval poll on each human prompt (#1350 part 2)  */
+/* ------------------------------------------------------------------ */
+
+// Runs on every prompt the human sends. If this session has calls waiting
+// on the local pending-approvals list, take one bounded (≤1.5s), silent-
+// on-failure look at their live status; a code that just turned "approved"
+// gets a model-facing line telling it to retry the identical call now.
+// Never blocks the prompt — absent, timed out, or nothing new, this hook
+// simply passes through.
+async function handleUserPromptSubmit() {
+  const sid = input.session_id ?? "unknown";
+  try {
+    // Subagents don't drive the human's prompt stream.
+    if (typeof input.agent_id === "string" && input.agent_id) process.exit(0);
+    if (!token) process.exit(0);
+    const list = readPending(sid);
+    const pendingIds = list.filter((e) => e && e.status === "pending").map((e) => e.id);
+    if (!pendingIds.length) process.exit(0);
+    const fresh = await refreshApprovals(pendingIds, 1500);
+    if (!fresh.size) process.exit(0);
+    const merged = mergeApprovalUpdates(list, fresh);
+    const newlyApproved = merged.filter((e, i) => e.status === "approved" && list[i]?.status === "pending");
+    writePending(sid, merged);
+    if (!newlyApproved.length) process.exit(0);
+    const context = newlyApproved.map((e) => `ACP-${e.code} was approved — retry the identical call now.`).join("\n");
+    // Codex only honors additionalContext on SessionStart; Copilot's
+    // dialect is unconfirmed for this field outside it. Fall back to the
+    // human channel on both rather than send a field the harness ignores.
+    process.stdout.write(JSON.stringify(
+      HARNESS === "claude-code"
+        ? { hookSpecificOutput: { hookEventName: "UserPromptSubmit", additionalContext: context } }
+        : { systemMessage: context },
+    ));
+  } catch {
+    // silent — an approval-status miss must never block the prompt
+  }
+  process.exit(0);
+}
+
 const hookEvent = typeof input.hook_event_name === "string" ? input.hook_event_name : "PreToolUse";
 if (hookEvent === "PostToolUse") handlePostToolUse();
 else if (hookEvent === "SessionStart") handleSessionStart();
 else if (hookEvent === "Stop") handleStop();
+else if (hookEvent === "SessionEnd") handleSessionEnd();
+else if (hookEvent === "UserPromptSubmit") handleUserPromptSubmit();
 else if (hookEvent === "UserPromptExpansion") handleUserPromptExpansion();
 else handlePreToolUse();
