@@ -1980,7 +1980,7 @@ function explainHeld(held) {
   if (!held || !held.reason) {
     return "[ACP] Nothing has been held in this session.";
   }
-  const clean = (v) => String(v ?? "").replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, " ");
+  const clean = (v) => String(v ?? "").replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g, " ");
   const lines = [`[ACP] Last held call${held.tool ? ` (${clean(held.tool)})` : ""} at ${clean(held.at)}:`, `  ${clean(held.reason)}`];
   // Gateway wording: "denied by <tier label> policy for <tool>" and
   // "step_up by <tier label> policy for <tool>"; the label can hold spaces
@@ -2098,12 +2098,12 @@ async function handleUserPromptExpansion() {
       const link = (v) => (typeof v === "string" && /^https:\/\/\S+$/.test(v) ? v : "");
       const asks = Array.isArray(s.pendingApprovals) && s.pendingApprovals.length
         ? `\nPending approvals (${s.pendingApprovals.length}):\n` + s.pendingApprovals.slice(0, 10).map((a) =>
-            `  ${String(a?.tool ?? "a tool call").replace(/[\u0000-\u001f\u007f]/g, " ").slice(0, 80)}  ${link(a?.review) || `${ACP_CONSOLE}/approvals`}`).join("\n")
+            `  ${String(a?.tool ?? "a tool call").replace(/[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g, " ").slice(0, 80)}  ${link(a?.review) || `${ACP_CONSOLE}/approvals`}`).join("\n")
         : "";
       // Advice feed (gatewaystack-connect#1325): the top suggestions from
       // your own usage, each with the command that acts on it. Absent when
       // the workspace isn't rolled out or the feed wasn't ready in time.
-      const clean = (v) => String(v ?? "").replace(/[\u0000-\u001f\u007f]/g, " ").slice(0, 300);
+      const clean = (v) => String(v ?? "").replace(/[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g, " ").slice(0, 300);
       const advice = Array.isArray(s.advice) && s.advice.length
         ? "\nSuggestions from your usage:\n" + s.advice.slice(0, 3).map((a) => {
             const cmd = a && typeof a.command === "string" && a.command ? `\n    → ${clean(a.command)}` : "";
