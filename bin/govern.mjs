@@ -2130,9 +2130,23 @@ async function handleUserPromptExpansion() {
       const hint = data?.hint ? ` ${data.hint}` : "";
       blockExpansion(`[ACP] /acp-${kind} not filed (${data?.error ?? `HTTP ${res.status}`}).${hint}`);
     }
-    const mins = Math.max(1, Math.round((data.expiresInSeconds ?? 600) / 60));
+    const mins = Math.max(1, Math.round((Number(data.expiresInSeconds) || 600) / 60));
+    const str = (v, fallback) => (typeof v === "string" && v.trim() ? v : fallback);
+    const describe = str(data.describe, `/acp-${kind} filed.`);
+    // Since gatewaystack-connect#1280 the gateway EMAILS the confirm link
+    // (status: "sent", to: masked address) and never returns it. Older
+    // gateways returned the link itself as `confirm`; keep printing that
+    // when it is actually an https URL.
+    const link = typeof data.confirm === "string" && /^https:\/\/\S+$/.test(data.confirm) ? data.confirm : "";
+    if (data.status === "sent" || !link) {
+      const to = str(data.to, "your account email");
+      blockExpansion(
+        `[ACP] ${describe}\n\nConfirm link emailed to ${to} — open it and tap Confirm (you, not the agent).\n` +
+        `Expires in ${mins} min. Nothing changes until you confirm.`,
+      );
+    }
     blockExpansion(
-      `[ACP] ${data.describe}\n\nConfirm (you, not the agent): ${data.confirm}\n` +
+      `[ACP] ${describe}\n\nConfirm (you, not the agent): ${link}\n` +
       `Expires in ${mins} min. Nothing changes until you open that link and tap Confirm.`,
     );
   } catch (err) {
