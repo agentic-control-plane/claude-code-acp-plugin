@@ -72,7 +72,7 @@ function preHook(sessionId, env = {}) {
     // unpriced-session notice (unpriced-session-notice.test.mjs) out of
     // these assertions, which are about the wire warning alone.
     const child = spawn(process.execPath, [GOVERN], {
-      env: { HOME, PATH: process.env.PATH, ACP_GOVERN_BASE: baseUrl, ACP_KEY: "gsk_test_deadbeef", ...env },
+      env: { HOME, PATH: process.env.PATH, ACP_SELF_HOST: "1", ACP_GOVERN_BASE: baseUrl, ACP_KEY: "gsk_test_deadbeef", ...env },
       stdio: ["pipe", "pipe", "pipe"],
     });
     let stdout = "";

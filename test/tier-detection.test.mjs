@@ -63,8 +63,8 @@ function hook(inputObj, env = {}) {
         HOME,
         PATH: process.env.PATH,
         ACP_BEARER_TOKEN: "test-token",
-        ACP_GOVERN_BASE: baseUrl,
-        ACP_API_BASE: baseUrl,
+        ACP_SELF_HOST: "1", ACP_GOVERN_BASE: baseUrl,
+        ACP_SELF_HOST: "1", ACP_API_BASE: baseUrl,
         // No CLAUDE_CODE_ENTRYPOINT / CI unless a test sets them — the
         // parent process may be running under CI itself.
         ...env,

@@ -89,7 +89,7 @@ function runHook(input, env = {}) {
       env: {
         HOME,
         PATH: process.env.PATH,
-        ACP_GOVERN_BASE: baseUrl,
+        ACP_SELF_HOST: "1", ACP_GOVERN_BASE: baseUrl,
         ACP_FIRST_ATTEMPT_MS: "1000",
         ACP_RETRY_ATTEMPT_MS: "1000",
         ...env,

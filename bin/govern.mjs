@@ -53,8 +53,37 @@ import { spawn } from "child_process";
 // Data-plane base. Vendor egress proxying (e.g. GH_HOST → /api/v3) must
 // stay on the main gateway — those routes are not served by the
 // control-plane service.
-const ACP_API =
-  process.env.ACP_API_BASE || "https://api.agenticcontrolplane.com";
+// acp-base:begin (inlined from lib/acp-base.mjs — keep in sync; see that file)
+function resolveAcpBase(raw, fallback, env = process.env, warn = () => {}) {
+  if (typeof raw !== "string" || raw.trim() === "") return fallback;
+  const value = raw.trim();
+  let u;
+  try { u = new URL(value); } catch { warn(value, "not a valid URL"); return fallback; }
+  if (u.username || u.password) { warn(value, "credentials in URL"); return fallback; }
+  const host = u.hostname.toLowerCase();
+  if (env.ACP_SELF_HOST === "1") {
+    const loopback = host === "localhost" || host === "127.0.0.1" || host === "[::1]";
+    if (u.protocol === "https:" || (u.protocol === "http:" && loopback)) return (u.origin + u.pathname).replace(/\/+$/, "");
+    warn(value, "ACP_SELF_HOST allows https, or http only on localhost");
+    return fallback;
+  }
+  if (u.protocol !== "https:") { warn(value, "must be https"); return fallback; }
+  if (host !== "agenticcontrolplane.com" && !/^([a-z0-9-]+\.)+agenticcontrolplane\.com$/.test(host)) {
+    warn(value, "host is not agenticcontrolplane.com or a subdomain (set ACP_SELF_HOST=1 to self-host)");
+    return fallback;
+  }
+  return (u.origin + u.pathname).replace(/\/+$/, "");
+}
+// acp-base:end
+let acpBaseWarned = false;
+function acpBaseWarn(value, why) {
+  if (acpBaseWarned) return;
+  acpBaseWarned = true;
+  process.stderr.write(`[ACP] ignoring ACP_API_BASE/ACP_GOVERN_BASE override (${why}); using the default gateway. Self-hosting? Set ACP_SELF_HOST=1.\n`);
+}
+
+const ACP_API = resolveAcpBase(
+  process.env.ACP_API_BASE, "https://api.agenticcontrolplane.com", process.env, acpBaseWarn);
 
 // Control-plane base for hook decisions + scoped-token exchange
 // (gatewaystack-connect#246). These have a 4s budget and go to a dedicated
@@ -62,10 +91,9 @@ const ACP_API =
 // ACP_API_BASE for self-hosted single-service deployments. The run.app URL
 // is Cloud Run's stable service address; a branded alias
 // (govern.agenticcontrolplane.com) may replace it in a future release.
-const ACP_GOVERN =
-  process.env.ACP_GOVERN_BASE ||
-  process.env.ACP_API_BASE ||
-  "https://govern.agenticcontrolplane.com";
+const ACP_GOVERN = resolveAcpBase(
+  process.env.ACP_GOVERN_BASE || process.env.ACP_API_BASE,
+  "https://govern.agenticcontrolplane.com", process.env, acpBaseWarn);
 
 const PLUGIN_VERSION = "0.27.0";
 

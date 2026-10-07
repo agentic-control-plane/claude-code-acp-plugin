@@ -69,7 +69,7 @@ function postHook(env = {}) {
   };
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [GOVERN], {
-      env: { HOME, PATH: process.env.PATH, ACP_GOVERN_BASE: baseUrl, ...env },
+      env: { HOME, PATH: process.env.PATH, ACP_SELF_HOST: "1", ACP_GOVERN_BASE: baseUrl, ...env },
       stdio: ["pipe", "pipe", "pipe"],
     });
     let stdout = "";

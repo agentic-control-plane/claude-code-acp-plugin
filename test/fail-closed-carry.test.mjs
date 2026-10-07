@@ -72,7 +72,7 @@ function runHook(input, governBase) {
       env: {
         HOME,
         PATH: process.env.PATH,
-        ACP_GOVERN_BASE: governBase,
+        ACP_SELF_HOST: "1", ACP_GOVERN_BASE: governBase,
         CI: "true",
         ACP_FIRST_ATTEMPT_MS: "400",
         ACP_RETRY_ATTEMPT_MS: "400",

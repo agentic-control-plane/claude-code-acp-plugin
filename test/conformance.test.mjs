@@ -127,7 +127,7 @@ function runPostToolUse(input, env = {}) {
       env: {
         HOME,
         PATH: process.env.PATH,
-        ACP_GOVERN_BASE: baseUrl,
+        ACP_SELF_HOST: "1", ACP_GOVERN_BASE: baseUrl,
         ACP_SHADOW: undefined,
         ...env,
       },

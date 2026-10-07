@@ -112,7 +112,7 @@ function preHook(sessionId, { env = {}, tool = "Bash", home = HOME, transcript =
   };
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [GOVERN], {
-      env: { HOME: home, PATH: process.env.PATH, ACP_GOVERN_BASE: baseUrl, CLAUDE_CODE_ENTRYPOINT: "cli", ...env },
+      env: { HOME: home, PATH: process.env.PATH, ACP_SELF_HOST: "1", ACP_GOVERN_BASE: baseUrl, CLAUDE_CODE_ENTRYPOINT: "cli", ...env },
       stdio: ["pipe", "pipe", "pipe"],
     });
     let stdout = "";

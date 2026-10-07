@@ -75,7 +75,7 @@ test("the running hook reports the LF hash even when its file on disk is CRLF", 
     // accepted (it aborts on its own 4s budget and the test sees nothing).
     const res = await new Promise((resolve) => {
       const child = spawn(process.execPath, [crlfPath], {
-        env: { HOME: home, PATH: process.env.PATH, ACP_GOVERN_BASE: base, ACP_API_BASE: base, ACP_BEARER_TOKEN: "gsk_test_token" },
+        env: { HOME: home, PATH: process.env.PATH, ACP_SELF_HOST: "1", ACP_GOVERN_BASE: base, ACP_API_BASE: base, ACP_BEARER_TOKEN: "gsk_test_token" },
       });
       let stdout = "", stderr = "";
       child.stdout.on("data", (d) => { stdout += d; });
