@@ -1905,18 +1905,36 @@ async function handleSessionStart() {
   // Connect moment (plugin#29): a session starting with a key and a
   // non-empty ledger is either a fresh connect or the first session after
   // an outage. Say what is about to upload, once, then flush detached.
+  //
+  // A hook run writes at most ONE stdout JSON object (plugin#43): Claude
+  // Code parses the whole stdout as one document, so two back-to-back
+  // objects are a red "not valid JSON" hook error and BOTH notices are
+  // lost. Every notice this event can raise is collected here and emitted
+  // once by finish(): human-channel lines (ledger upload, daily offer) in
+  // systemMessage, model-channel lines (upgrade, stale hook) in
+  // additionalContext.
   const buffered = ledgerCount();
-  if (buffered > 0) {
-    process.stdout.write(JSON.stringify({
-      systemMessage: `[ACP] ${buffered} tool call${buffered === 1 ? "" : "s"} recorded while ACP could not see them (offline, or before this key was connected) are uploading once now; they will appear in your audit with their original timestamps.`,
-    }));
-    maybeSpawnFlush();
-  }
+  const flushNotice = buffered > 0
+    ? `[ACP] ${buffered} tool call${buffered === 1 ? "" : "s"} recorded while ACP could not see them (offline, or before this key was connected) are uploading once now; they will appear in your audit with their original timestamps.`
+    : null;
+  if (flushNotice) maybeSpawnFlush();
+  let context = null;
+  let offer = null;
+  const finish = () => {
+    const systemMessage = [flushNotice, offer].filter(Boolean).join("\n");
+    if (context || systemMessage) {
+      process.stdout.write(JSON.stringify({
+        ...(context ? { hookSpecificOutput: { hookEventName: "SessionStart", additionalContext: context } } : {}),
+        ...(systemMessage ? { systemMessage } : {}),
+      }));
+    }
+    process.exit(0);
+  };
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 4000);
   try {
     const hookHash = sha256FileHex(fileURLToPath(import.meta.url));
-    if (!hookHash) process.exit(0);
+    if (!hookHash) finish();
     const grantsHash = sha256FileHex(join(homedir(), ".acp", "harness-grants.json"));
     const res = await fetch(`${ACP_GOVERN}/govern/attest`, {
       method: "POST",
@@ -1945,30 +1963,19 @@ async function handleSessionStart() {
     // enforcement would have held this week and the command that turns it
     // on. Human channel only — it names a command for the HUMAN to type.
     // The gateway sends it at most once per day per workspace.
-    const offer = data && typeof data.offer === "string" && data.offer.trim() ? data.offer.trim() : null;
+    offer = data && typeof data.offer === "string" && data.offer.trim() ? data.offer.trim() : null;
     // Stale-hook line: headers first, then the attest body's
     // latestVersion / minGoodVersion. Appended to the upgrade notice when
     // both are present, never replacing it.
     const staleNotice = staleHookNotice(res, data);
     const upgradeNotice = data && typeof data.notice === "string" && data.notice.trim() ? data.notice.trim() : null;
-    const context = [upgradeNotice, staleNotice].filter(Boolean).join("\n");
-    if (context) {
-      process.stdout.write(JSON.stringify({
-        hookSpecificOutput: {
-          hookEventName: "SessionStart",
-          additionalContext: context,
-        },
-        ...(offer ? { systemMessage: offer } : {}),
-      }));
-    } else if (offer) {
-      process.stdout.write(JSON.stringify({ systemMessage: offer }));
-    }
+    context = [upgradeNotice, staleNotice].filter(Boolean).join("\n") || null;
   } catch {
     // silent — absence of attestation is visible server-side by design
   } finally {
     clearTimeout(timeout);
   }
-  process.exit(0);
+  finish();
 }
 
 /* ------------------------------------------------------------------ */
