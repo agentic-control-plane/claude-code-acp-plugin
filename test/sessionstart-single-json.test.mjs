@@ -15,6 +15,10 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+// Since #50 the hook ignores ACP_GOVERN_BASE unless the origin is an ACP host;
+// the loopback stub is reached via ~/.acp/dev_base_override, which this shim
+// writes into the temp HOME when ACP_TEST_DEV_BASE=1 is in the spawn env.
+import "./_dev-base.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const GOVERN = join(ROOT, "bin", "govern.mjs");
@@ -50,7 +54,7 @@ function fakeGateway(attestBody, attestHeaders = {}) {
 function sessionStart(home, port) {
   return new Promise((resolve) => {
     const child = spawn(process.execPath, [GOVERN], {
-      env: { PATH: process.env.PATH, HOME: home, ACP_GOVERN_BASE: `http://${LOOPBACK}:${port}`, CLAUDE_CODE_ENTRYPOINT: "cli" },
+      env: { PATH: process.env.PATH, HOME: home, ACP_TEST_DEV_BASE: "1", ACP_GOVERN_BASE: `http://${LOOPBACK}:${port}`, CLAUDE_CODE_ENTRYPOINT: "cli" },
       stdio: ["pipe", "pipe", "pipe"],
     });
     let stdout = "";
