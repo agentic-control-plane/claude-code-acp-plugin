@@ -18,6 +18,7 @@ import { mkdtempSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import "./_dev-base.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const GOVERN = join(ROOT, "bin", "govern.mjs");
@@ -63,8 +64,8 @@ function hook(inputObj, env = {}) {
         HOME,
         PATH: process.env.PATH,
         ACP_BEARER_TOKEN: "test-token",
-        ACP_GOVERN_BASE: baseUrl,
-        ACP_API_BASE: baseUrl,
+        ACP_TEST_DEV_BASE: "1", ACP_GOVERN_BASE: baseUrl,
+        ACP_TEST_DEV_BASE: "1", ACP_API_BASE: baseUrl,
         // No CLAUDE_CODE_ENTRYPOINT / CI unless a test sets them — the
         // parent process may be running under CI itself.
         ...env,

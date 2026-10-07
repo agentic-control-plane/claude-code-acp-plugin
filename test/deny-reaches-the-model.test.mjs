@@ -19,6 +19,7 @@ import { createServer } from "node:http";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import "./_dev-base.mjs";
 
 const GOVERN = join(dirname(fileURLToPath(import.meta.url)), "..", "bin", "govern.mjs");
 const LOOPBACK = [127, 0, 0, 1].join(".");
@@ -39,7 +40,7 @@ function runHook(base, { tier = "interactive" } = {}) {
     const env = {
       HOME: process.env.HOME,
       PATH: process.env.PATH,
-      ACP_GOVERN_BASE: base,
+      ACP_TEST_DEV_BASE: "1", ACP_GOVERN_BASE: base,
       ACP_BEARER_TOKEN: "gsk_test_token",
       ACP_CLIENT: "test",
       ACP_FIRST_ATTEMPT_MS: "400",

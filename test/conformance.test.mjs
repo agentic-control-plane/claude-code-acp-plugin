@@ -18,6 +18,7 @@ import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import "./_dev-base.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const GOVERN = join(ROOT, "bin", "govern.mjs");
@@ -127,7 +128,7 @@ function runPostToolUse(input, env = {}) {
       env: {
         HOME,
         PATH: process.env.PATH,
-        ACP_GOVERN_BASE: baseUrl,
+        ACP_TEST_DEV_BASE: "1", ACP_GOVERN_BASE: baseUrl,
         ACP_SHADOW: undefined,
         ...env,
       },

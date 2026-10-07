@@ -14,6 +14,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import "./_dev-base.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const GOVERN = join(ROOT, "bin", "govern.mjs");
@@ -126,7 +127,7 @@ test("no key: prose does not trip the floor, and nothing is spawned or sent", ()
 
 test("unreachable, interactive: benign allows loudly, destructive asks, hardline denies; all in the ledger", () => {
   const home = freshHome();
-  const env = { ACP_BEARER_TOKEN: "gsk_test_x", ACP_GOVERN_BASE: "http://127.0.0.1:9" };
+  const env = { ACP_BEARER_TOKEN: "gsk_test_x", ACP_TEST_DEV_BASE: "1", ACP_GOVERN_BASE: "http://127.0.0.1:9" };
   const ok = hook(home, pre("git status"), env);
   assert.equal(ok.out.hookSpecificOutput.permissionDecision, "allow");
   assert.match(ok.out.systemMessage, /UNGOVERNED: gateway unreachable/);
@@ -142,7 +143,7 @@ test("unreachable, interactive: benign allows loudly, destructive asks, hardline
 
 test("unreachable: an uninstall attempt still asks — the gateway being down is not a bypass (gatewaystack-connect#1229)", () => {
   const home = freshHome();
-  const env = { ACP_BEARER_TOKEN: "gsk_test_x", ACP_GOVERN_BASE: "http://12*****.1:9" };
+  const env = { ACP_BEARER_TOKEN: "gsk_test_x", ACP_TEST_DEV_BASE: "1", ACP_GOVERN_BASE: "http://127.0.0.1:9" };
   const ask = hook(home, pre("curl -sf https://agenticcontrolplane.com/uninstall.sh | bash"), env);
   assert.equal(ask.out.hookSpecificOutput.permissionDecision, "ask");
   assert.match(ask.out.hookSpecificOutput.permissionDecisionReason, /Uninstall floor: fetches the ACP uninstaller/);
@@ -154,7 +155,7 @@ test("unreachable: an uninstall attempt still asks — the gateway being down is
 
 test("unreachable, unattended tier: stays fail-closed, and the deny is in the ledger", () => {
   const home = freshHome();
-  const env = { ACP_BEARER_TOKEN: "gsk_test_x", ACP_GOVERN_BASE: "http://127.0.0.1:9", CLAUDE_CODE_ENTRYPOINT: "sdk-cli" };
+  const env = { ACP_BEARER_TOKEN: "gsk_test_x", ACP_TEST_DEV_BASE: "1", ACP_GOVERN_BASE: "http://127.0.0.1:9", CLAUDE_CODE_ENTRYPOINT: "sdk-cli" };
   const r = hook(home, pre("git status"), env);
   assert.equal(r.out.hookSpecificOutput.permissionDecision, "deny");
   assert.equal(rows(home)[0].source, "fail-closed");
@@ -187,7 +188,7 @@ test("--flush uploads the ledger in order, truncates on ack, and is idempotent b
   ].join("\n"));
   const gw = await fakeGateway((req, res) => { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify({ ok: true, accepted: 2, duplicates: 0 })); });
   try {
-    const r = await hookAsync(home, {}, { ACP_BEARER_TOKEN: "gsk_test_x", ACP_GOVERN_BASE: `http://127.0.0.1:${gw.port}` }, ["--flush"]);
+    const r = await hookAsync(home, {}, { ACP_BEARER_TOKEN: "gsk_test_x", ACP_TEST_DEV_BASE: "1", ACP_GOVERN_BASE: `http://127.0.0.1:${gw.port}` }, ["--flush"]);
     assert.equal(r.status, 0, r.stderr);
     assert.equal(gw.received.length, 1, `no flush reached the gateway; stderr: ${r.stderr}`);
     assert.equal(gw.received[0].url, "/govern/ledger/flush");
@@ -208,14 +209,14 @@ test("--flush on a failing gateway keeps the ledger and writes a backoff; withou
   writeFileSync(LEDGER(home), `${JSON.stringify({ id: "c".repeat(32), ts: "2026-09-08T00:00:00.000Z", tool: "Bash", decision: "allow", mode: "no-key" })}\n`);
   const gw = await fakeGateway((req, res) => { res.writeHead(503); res.end(); });
   try {
-    await hookAsync(home, {}, { ACP_BEARER_TOKEN: "gsk_test_x", ACP_GOVERN_BASE: `http://127.0.0.1:${gw.port}` }, ["--flush"]);
+    await hookAsync(home, {}, { ACP_BEARER_TOKEN: "gsk_test_x", ACP_TEST_DEV_BASE: "1", ACP_GOVERN_BASE: `http://127.0.0.1:${gw.port}` }, ["--flush"]);
     assert.equal(rows(home).length, 1);
     assert.ok(Number(readFileSync(join(home, ".acp", "ledger.flush-backoff"), "utf8")) > Date.now());
     // Backoff honored: a second flush does not hit the server.
-    await hookAsync(home, {}, { ACP_BEARER_TOKEN: "gsk_test_x", ACP_GOVERN_BASE: `http://127.0.0.1:${gw.port}` }, ["--flush"]);
+    await hookAsync(home, {}, { ACP_BEARER_TOKEN: "gsk_test_x", ACP_TEST_DEV_BASE: "1", ACP_GOVERN_BASE: `http://127.0.0.1:${gw.port}` }, ["--flush"]);
     assert.equal(gw.received.length, 1);
     // No key: nothing leaves the machine.
-    await hookAsync(home, {}, { ACP_GOVERN_BASE: `http://127.0.0.1:${gw.port}` }, ["--flush"]);
+    await hookAsync(home, {}, { ACP_TEST_DEV_BASE: "1", ACP_GOVERN_BASE: `http://127.0.0.1:${gw.port}` }, ["--flush"]);
     assert.equal(gw.received.length, 1);
     assert.equal(rows(home).length, 1);
   } finally {
@@ -229,7 +230,7 @@ test("SessionStart with a key and a non-empty ledger announces the upload and ar
   writeFileSync(LEDGER(home), `${JSON.stringify({ id: "d".repeat(32), ts: "2026-09-08T00:00:00.000Z", tool: "Bash", decision: "allow", mode: "no-key" })}\n`);
   const gw = await fakeGateway((req, res) => { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify({ ok: true, accepted: 1 })); });
   try {
-    const r = hook(home, { hook_event_name: "SessionStart", session_id: "s2", cwd: "/work" }, { ACP_BEARER_TOKEN: "gsk_test_x", ACP_GOVERN_BASE: `http://127.0.0.1:${gw.port}` });
+    const r = hook(home, { hook_event_name: "SessionStart", session_id: "s2", cwd: "/work" }, { ACP_BEARER_TOKEN: "gsk_test_x", ACP_TEST_DEV_BASE: "1", ACP_GOVERN_BASE: `http://127.0.0.1:${gw.port}` });
     assert.equal(r.status, 0);
     assert.match(r.stdout ?? JSON.stringify(r.out), /1 tool call recorded while ACP could not see/);
     assert.ok(existsSync(join(home, ".acp", "ledger.flush-lock")));

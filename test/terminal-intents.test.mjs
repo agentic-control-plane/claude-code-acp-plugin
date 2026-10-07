@@ -30,6 +30,7 @@ import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import "./_dev-base.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const GOVERN = join(ROOT, "bin", "govern.mjs");
@@ -111,7 +112,7 @@ function runHook(input, env = {}, useHome = HOME) {
       env: {
         HOME: useHome,
         PATH: process.env.PATH,
-        ACP_API_BASE: baseUrl,
+        ACP_TEST_DEV_BASE: "1", ACP_API_BASE: baseUrl,
         CLAUDE_CODE_ENTRYPOINT: "cli",
         ...env,
       },
@@ -260,7 +261,7 @@ test("(h) unreachable stub → blocked mentioning ACP was unreachable", async ()
   const deadPort = closedServer.address().port;
   await new Promise((resolve) => closedServer.close(resolve));
 
-  const out = await runHook(expansion(), { ACP_API_BASE: `http://127.0.0.1:${deadPort}` });
+  const out = await runHook(expansion(), { ACP_TEST_DEV_BASE: "1", ACP_API_BASE: `http://127.0.0.1:${deadPort}` });
   assert.ok(out, "expected output on stdout");
   assert.equal(out.decision, "block");
   assert.match(out.reason, /Couldn't reach ACP/);

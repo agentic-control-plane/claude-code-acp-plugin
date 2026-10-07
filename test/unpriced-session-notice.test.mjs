@@ -39,6 +39,7 @@ import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import "./_dev-base.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const GOVERN = join(ROOT, "bin", "govern.mjs");
@@ -112,7 +113,7 @@ function preHook(sessionId, { env = {}, tool = "Bash", home = HOME, transcript =
   };
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [GOVERN], {
-      env: { HOME: home, PATH: process.env.PATH, ACP_GOVERN_BASE: baseUrl, CLAUDE_CODE_ENTRYPOINT: "cli", ...env },
+      env: { HOME: home, PATH: process.env.PATH, ACP_TEST_DEV_BASE: "1", ACP_GOVERN_BASE: baseUrl, CLAUDE_CODE_ENTRYPOINT: "cli", ...env },
       stdio: ["pipe", "pipe", "pipe"],
     });
     let stdout = "";

@@ -33,6 +33,7 @@ import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import "./_dev-base.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const GOVERN = join(ROOT, "bin", "govern.mjs");
@@ -87,7 +88,7 @@ function runHook(input, extraEnv) {
     // plain-launch notice (unpriced-session-notice.test.mjs) out of these
     // assertions, which are about the PostToolUse body alone.
     const child = spawn(process.execPath, [GOVERN], {
-      env: { HOME, PATH: process.env.PATH, ACP_GOVERN_BASE: baseUrl, CLAUDE_CODE_ENTRYPOINT: "cli", ACP_KEY: "gsk_test_deadbeef", ...(extraEnv || {}) },
+      env: { HOME, PATH: process.env.PATH, ACP_TEST_DEV_BASE: "1", ACP_GOVERN_BASE: baseUrl, CLAUDE_CODE_ENTRYPOINT: "cli", ACP_KEY: "gsk_test_deadbeef", ...(extraEnv || {}) },
       stdio: ["pipe", "pipe", "pipe"],
     });
     let stdout = "";
@@ -405,7 +406,7 @@ test("a non-2xx leaves the offset where it was; the next call re-sends the same 
 test("a network error (connection refused) is a failed send too, not a silent advance", async () => {
   const path = transcriptPath();
   writeFileSync(path, assistantLine("msg_N1", usage(1, 0, 0, 10)));
-  const r = await runHook(post("sess-net", path), { ACP_GOVERN_BASE: `http://${LOOPBACK}:1` });
+  const r = await runHook(post("sess-net", path), { ACP_TEST_DEV_BASE: "1", ACP_GOVERN_BASE: `http://${LOOPBACK}:1` });
   assert.equal(r.code, 0);
   const off = offsetsFile()[path];
   assert.equal(off.off, 0);
