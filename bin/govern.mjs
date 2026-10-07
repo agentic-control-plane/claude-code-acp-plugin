@@ -325,6 +325,39 @@ function normalizeCopilotInput(input) {
   return true;
 }
 
+// Receipt chokepoint (#1348): every verdict this hook emits leaves through
+// stdout, so held (ask) and denied (deny) verdicts are counted HERE,
+// whichever path produced them — gateway verdict, local policy engine,
+// offline destructive floor, fail-closed outage or key rejection. The Stop
+// turn line and the SessionEnd receipt read these counters, so a deny the
+// human must see cannot slip through a path that forgot to bump one.
+// A gateway hold reaches Codex-style harnesses as a "deny" that carries an
+// approval_id; the emitting path sets receiptVerdictHint = "held" so it is
+// counted as a hold, not a refusal.
+let receiptVerdictHint = null;
+{
+  const rawWrite = process.stdout.write.bind(process.stdout);
+  process.stdout.write = (chunk, ...rest) => {
+    try {
+      const o = JSON.parse(String(chunk));
+      const d = o?.hookSpecificOutput?.permissionDecision ?? o?.permissionDecision;
+      const kind = receiptVerdictHint ?? (d === "ask" ? "held" : d === "deny" ? "denied" : null);
+      receiptVerdictHint = null;
+      if (kind === "held") recordVerdictForReceipt({ held: 1 });
+      else if (kind === "denied") recordVerdictForReceipt({ denied: 1 });
+    } catch { /* not one of our JSON verdicts */ }
+    return rawWrite(chunk, ...rest);
+  };
+}
+
+function recordVerdictForReceipt(delta) {
+  try {
+    const sid = typeof input === "object" && input ? input.session_id : undefined;
+    bumpTurnStats(sid, delta);
+    bumpReceiptStats(sid, delta);
+  } catch { /* bookkeeping must never touch the call path */ }
+}
+
 if (HARNESS === "copilot") {
   const rawWrite = process.stdout.write.bind(process.stdout);
   process.stdout.write = (chunk, ...rest) => {
@@ -1224,9 +1257,10 @@ async function handlePreToolUse() {
     "This call is decided in the ACP console or from the approval email. Do what the reason says: call acp_wait_approval with that approval_id, retry the identical call only after it reports approved, and stop if it reports denied or timeout. Keep working on anything that does not need this call while you wait.";
   function denyByPolicy(reason, kind, verdict) {
     rememberHeld(reason, kind);
-    rememberPendingApproval(approvalMeta(verdict));
-    bumpTurnHeld();
-    const steer = /\bacp_wait_approval\b/.test(reason) ? WAIT_STEER : STEER_BY_KIND[kind]
+    const held = approvalMeta(verdict);
+    rememberPendingApproval(held);
+    if (held) receiptVerdictHint = "held";
+    const steer =/\bacp_wait_approval\b/.test(reason) ? WAIT_STEER : STEER_BY_KIND[kind]
       || (UNPROPOSABLE.test(reason) ? STEER_BY_KIND.terminal : STEER_BY_KIND.reformulate);
     process.stdout.write(JSON.stringify({
       hookSpecificOutput: {
@@ -1354,7 +1388,6 @@ async function handlePreToolUse() {
   function ask(reason, verdict) {
     rememberHeld(reason, "ask");
     rememberPendingApproval(approvalMeta(verdict));
-    bumpTurnHeld();
     // Codex has no ask semantic on the wire (see HARNESS note): emit deny
     // with the approval deep link so the human approves out-of-band and
     // the re-run passes under the grant.
@@ -2089,9 +2122,15 @@ function receiptStatsPath(sessionId) {
 function readReceiptStats(sessionId) {
   try {
     const raw = JSON.parse(readFileSync(receiptStatsPath(sessionId), "utf8"));
-    return { calls: Number(raw.calls) || 0, flagged: Number(raw.flagged) || 0, notices: Number(raw.notices) || 0 };
+    return {
+      calls: Number(raw.calls) || 0,
+      flagged: Number(raw.flagged) || 0,
+      notices: Number(raw.notices) || 0,
+      held: Number(raw.held) || 0,
+      denied: Number(raw.denied) || 0,
+    };
   } catch {
-    return { calls: 0, flagged: 0, notices: 0 };
+    return { calls: 0, flagged: 0, notices: 0, held: 0, denied: 0 };
   }
 }
 
@@ -2104,6 +2143,8 @@ function bumpReceiptStats(sessionId, delta) {
       calls: cur.calls + (delta.calls ?? 0),
       flagged: cur.flagged + (delta.flagged ?? 0),
       notices: cur.notices + (delta.notices ?? 0),
+      held: cur.held + (delta.held ?? 0),
+      denied: (cur.denied ?? 0) + (delta.denied ?? 0),
     }));
   } catch { /* bookkeeping must never touch the call path */ }
 }
@@ -2304,9 +2345,10 @@ function readTurnStats(sessionId) {
       shadow: Number(raw.shadow) || 0,
       cost: Number(raw.cost) || 0,
       held: Number(raw.held) || 0,
+      denied: Number(raw.denied) || 0,
     };
   } catch {
-    return { calls: 0, flagged: 0, shadow: 0, cost: 0, held: 0 };
+    return { calls: 0, flagged: 0, shadow: 0, cost: 0, held: 0, denied: 0 };
   }
 }
 
@@ -2321,16 +2363,13 @@ function bumpTurnStats(sessionId, delta) {
       shadow: cur.shadow + (delta.shadow ?? 0),
       cost: cur.cost + (delta.cost ?? 0),
       held: cur.held + (delta.held ?? 0),
+      denied: (cur.denied ?? 0) + (delta.denied ?? 0),
     }));
   } catch { /* bookkeeping must never touch the call path */ }
 }
 
 function clearTurnStats(sessionId) {
   try { unlinkSync(turnStatsPath(sessionId)); } catch { /* absent is fine */ }
-}
-
-function bumpTurnHeld() {
-  bumpTurnStats(input.session_id, { held: 1 });
 }
 
 /* ── UNGOVERNED outage dedup (#1352 part 3) ──
@@ -2401,8 +2440,14 @@ function clearReceiptStats(sessionId) {
 }
 
 function buildReceiptLine(stats, sessionId) {
-  if (!stats || stats.calls <= 0) return null;
+  if (!stats) return null;
+  // Held and denied calls never reach PostToolUse, so a session made only
+  // of them has calls == 0 and still earns a receipt: those are exactly the
+  // lines a human must see.
+  if (stats.calls <= 0 && !(stats.held > 0) && !(stats.denied > 0)) return null;
   const parts = [`${stats.calls} tool call${stats.calls === 1 ? "" : "s"} governed`];
+  if (stats.held > 0) parts.push(`${stats.held} held for approval`);
+  if (stats.denied > 0) parts.push(`${stats.denied} denied`);
   if (stats.flagged > 0) parts.push(`${stats.flagged} flagged`);
   if (stats.notices > 0) parts.push(`${stats.notices} shadow notice${stats.notices === 1 ? "" : "s"}`);
   // A shadow notice only ever fires in audit mode, so notices > 0 means
@@ -2428,9 +2473,10 @@ function handleStop() {
     const turn = readTurnStats(sid);
     const pending = readPending(sid).filter((e) => e && e.status === "pending");
     const parts = [];
-    if (turn.held || turn.flagged || turn.shadow || turn.cost) {
+    if (turn.held || turn.denied || turn.flagged || turn.shadow || turn.cost) {
       const bits = [];
       if (turn.held) bits.push(`${turn.held} held`);
+      if (turn.denied) bits.push(`${turn.denied} denied`);
       if (turn.flagged) bits.push(`${turn.flagged} flagged`);
       if (turn.shadow) bits.push(`${turn.shadow} shadow notice${turn.shadow === 1 ? "" : "s"}`);
       if (turn.cost) bits.push(`${turn.cost} cost notice${turn.cost === 1 ? "" : "s"}`);

@@ -171,3 +171,17 @@ test("SessionEnd is silent when the session made no governed calls", async () =>
   const out = await runHook(sessionEnd("sess-end-empty"));
   assert.equal(out, null);
 });
+
+// A denied call never reaches PostToolUse, so a session made only of denies
+// has calls == 0. The human must still see it: on the turn line and on the
+// end-of-session receipt (review finding on #48).
+test("a policy deny is counted on the turn line and earns a receipt even with no allowed calls", async () => {
+  const sid = "sess-deny-only";
+  nextToolUse = { decision: "deny", reason: "no rm -rf here", kind: "terminal" };
+  await runHook(preToolUse(sid));
+  const out1 = await runHook(stop(sid));
+  assert.match(out1.systemMessage, /This turn: 1 denied/);
+  assert.ok(!out1.systemMessage.includes("held"), "a plain deny is not a hold");
+  const out2 = await runHook(sessionEnd(sid));
+  assert.match(out2.systemMessage, /Session receipt: 0 tool calls governed · 1 denied/);
+});
