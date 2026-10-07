@@ -75,7 +75,7 @@ test("the running hook reports the LF hash even when its file on disk is CRLF", 
     // accepted (it aborts on its own 4s budget and the test sees nothing).
     const res = await new Promise((resolve) => {
       const child = spawn(process.execPath, [crlfPath], {
-        env: { HOME: home, PATH: process.env.PATH, ACP_SELF_HOST: "1", ACP_GOVERN_BASE: base, ACP_API_BASE: base, ACP_BEARER_TOKEN: "gsk_test_token" },
+        env: { HOME: home, PATH: process.env.PATH, ACP_TEST_DEV_BASE: "1", ACP_GOVERN_BASE: base, ACP_API_BASE: base, ACP_BEARER_TOKEN: "gsk_test_token" },
       });
       let stdout = "", stderr = "";
       child.stdout.on("data", (d) => { stdout += d; });
@@ -134,6 +134,7 @@ test("an attestation without a hook hash is no attestation at all", () => {
 });
 
 import { attestNoticeOutput } from "../lib/attestation.mjs";
+import "./_dev-base.mjs";
 
 test("upgrade notice from the attest response becomes SessionStart additionalContext", () => {
   const out = attestNoticeOutput({ ok: true, verdict: "attested", notice: "  [ACP] v0.13.0 available  " });

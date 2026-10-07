@@ -53,53 +53,82 @@ import { spawn } from "child_process";
 // Data-plane base. Vendor egress proxying (e.g. GH_HOST → /api/v3) must
 // stay on the main gateway — those routes are not served by the
 // control-plane service.
-// acp-base:begin (inlined from lib/acp-base.mjs — keep in sync; see that file)
-function resolveAcpBase(raw, fallback, env = process.env, warn = () => {}) {
-  if (typeof raw !== "string" || raw.trim() === "") return fallback;
-  const value = raw.trim();
+// The ACP_*_BASE env vars may only pick an allowlisted https ACP host; see
+// lib/acp-base.mjs for the rules. The block between the markers is that file
+// with `export ` removed — test/acp-base.test.mjs checks the two are identical.
+// acp-base:begin
+const ACP_HOSTS = ["api.agenticcontrolplane.com", "govern.agenticcontrolplane.com", "cloud.agenticcontrolplane.com"];
+
+function acpBaseCheck(raw, dev) {
   let u;
-  try { u = new URL(value); } catch { warn(value, "not a valid URL"); return fallback; }
-  if (u.username || u.password) { warn(value, "credentials in URL"); return fallback; }
+  try { u = new URL(String(raw).trim()); } catch { return { why: "not a valid URL" }; }
+  if (u.username || u.password) return { why: "credentials in URL" };
   const host = u.hostname.toLowerCase();
-  if (env.ACP_SELF_HOST === "1") {
+  if (dev) {
     const loopback = host === "localhost" || host === "127.0.0.1" || host === "[::1]";
-    if (u.protocol === "https:" || (u.protocol === "http:" && loopback)) return (u.origin + u.pathname).replace(/\/+$/, "");
-    warn(value, "ACP_SELF_HOST allows https, or http only on localhost");
-    return fallback;
+    if (u.protocol === "https:" || (u.protocol === "http:" && loopback)) return { ok: u.origin };
+    return { why: "dev override must be https, or http on a loopback host" };
   }
-  if (u.protocol !== "https:") { warn(value, "must be https"); return fallback; }
-  if (host !== "agenticcontrolplane.com" && !/^([a-z0-9-]+\.)+agenticcontrolplane\.com$/.test(host)) {
-    warn(value, "host is not agenticcontrolplane.com or a subdomain (set ACP_SELF_HOST=1 to self-host)");
-    return fallback;
-  }
-  return (u.origin + u.pathname).replace(/\/+$/, "");
+  if (u.protocol !== "https:") return { why: "must be https" };
+  if (!ACP_HOSTS.includes(host)) return { why: `host is not one of ${ACP_HOSTS.join(", ")}` };
+  if (u.port) return { why: "explicit port not allowed" };
+  return { ok: u.origin };
+}
+
+// Env override: an allowlisted origin, or `fallback` (with one warn call).
+function resolveAcpBase(raw, fallback, warn = () => {}) {
+  if (typeof raw !== "string" || raw.trim() === "") return fallback;
+  const r = acpBaseCheck(raw, false);
+  if (r.ok === undefined) { warn(raw.trim(), r.why); return fallback; }
+  return r.ok;
+}
+
+// Dev/test override file: the first non-blank, non-comment line is the URL.
+// Returns the validated origin, or undefined (missing, empty or invalid file).
+function readDevBaseOverride(path, warn = () => {}) {
+  let text;
+  try { text = readFileSync(path, "utf8"); } catch { return undefined; }
+  const line = text.split("\n").map((l) => l.trim()).find((l) => l && !l.startsWith("#"));
+  if (!line) return undefined;
+  const r = acpBaseCheck(line, true);
+  if (r.ok === undefined) { warn(line, `${path}: ${r.why}`); return undefined; }
+  return r.ok;
 }
 // acp-base:end
 let acpBaseWarned = false;
 function acpBaseWarn(value, why) {
   if (acpBaseWarned) return;
   acpBaseWarned = true;
-  process.stderr.write(`[ACP] ignoring ACP_API_BASE/ACP_GOVERN_BASE override (${why}); using the default gateway. Self-hosting? Set ACP_SELF_HOST=1.\n`);
+  process.stderr.write(`[ACP] ignoring ACP_API_BASE/ACP_GOVERN_BASE/ACP_CONSOLE_BASE override (${why}); using the default.\n`);
 }
 
-const ACP_API = resolveAcpBase(
-  process.env.ACP_API_BASE, "https://api.agenticcontrolplane.com", process.env, acpBaseWarn);
+// Dev/test only: a URL in ~/.acp/dev_base_override (a file under the user's
+// home — a cloned repo cannot write it) replaces the gateway base for both
+// ACP_API and ACP_GOVERN. It is the only way to reach http loopback or a
+// host outside ACP_HOSTS; the env vars above can never do that.
+const ACP_DEV_BASE = readDevBaseOverride(join(homedir(), ".acp", "dev_base_override"), acpBaseWarn);
+if (ACP_DEV_BASE !== undefined) {
+  process.stderr.write(`[ACP] dev override active: gateway base is ${ACP_DEV_BASE} (from ~/.acp/dev_base_override)\n`);
+}
+
+const ACP_API = ACP_DEV_BASE ?? resolveAcpBase(
+  process.env.ACP_API_BASE, "https://api.agenticcontrolplane.com", acpBaseWarn);
 
 // Control-plane base for hook decisions + scoped-token exchange
 // (gatewaystack-connect#246). These have a 4s budget and go to a dedicated
-// service so they never queue behind model-proxy streams. Falls back to
-// ACP_API_BASE for self-hosted single-service deployments. The run.app URL
-// is Cloud Run's stable service address; a branded alias
-// (govern.agenticcontrolplane.com) may replace it in a future release.
-const ACP_GOVERN = resolveAcpBase(
+// service so they never queue behind model-proxy streams. ACP_API_BASE
+// covers both when ACP_GOVERN_BASE is unset.
+const ACP_GOVERN = ACP_DEV_BASE ?? resolveAcpBase(
   process.env.ACP_GOVERN_BASE || process.env.ACP_API_BASE,
-  "https://govern.agenticcontrolplane.com", process.env, acpBaseWarn);
+  "https://govern.agenticcontrolplane.com", acpBaseWarn);
 
 const PLUGIN_VERSION = "0.27.0";
 
-// Console base for user-facing deep links (session receipt, #606).
-const ACP_CONSOLE =
-  process.env.ACP_CONSOLE_BASE || "https://cloud.agenticcontrolplane.com";
+// Console base for user-facing deep links (session receipt, #606; enrolment
+// hint). Validated like the gateway bases: a poisoned value would otherwise
+// be printed as the place to go and paste an API key.
+const ACP_CONSOLE = resolveAcpBase(
+  process.env.ACP_CONSOLE_BASE, "https://cloud.agenticcontrolplane.com", acpBaseWarn);
 
 // Per-session receipt counters (Stop hook). Written best-effort on
 // PostToolUse, read + cleared by handleStop.

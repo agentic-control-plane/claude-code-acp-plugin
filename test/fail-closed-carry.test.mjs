@@ -24,6 +24,7 @@ import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import "./_dev-base.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const GOVERN = join(ROOT, "bin", "govern.mjs");
@@ -72,7 +73,7 @@ function runHook(input, governBase) {
       env: {
         HOME,
         PATH: process.env.PATH,
-        ACP_SELF_HOST: "1", ACP_GOVERN_BASE: governBase,
+        ACP_TEST_DEV_BASE: "1", ACP_GOVERN_BASE: governBase,
         CI: "true",
         ACP_FIRST_ATTEMPT_MS: "400",
         ACP_RETRY_ATTEMPT_MS: "400",
