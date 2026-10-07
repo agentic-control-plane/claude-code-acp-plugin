@@ -67,9 +67,9 @@ test("floor: catastrophe laundered through bash -c after && is still denied", ()
   assert.equal(out.hookSpecificOutput.permissionDecision, "deny");
 });
 
-test("floor: force-push to main is denied", () => {
+test("floor: force-push to main asks (#1335: destructive floor, not hardline)", () => {
   const out = hook(pre("git push --force origin main"));
-  assert.equal(out.hookSpecificOutput.permissionDecision, "deny");
+  assert.equal(out.hookSpecificOutput.permissionDecision, "ask");
   assert.match(out.hookSpecificOutput.permissionDecisionReason, /force-push/);
 });
 
@@ -173,7 +173,7 @@ test("ACP_LOCAL=1 with no policy file: floor still active, default allow for the
   copyFileSync(DECIDE, join(bare, ".acp", "decide.mjs"));
   try {
     const denied = spawnSync(process.execPath, [GOVERN], {
-      input: JSON.stringify(pre("git push -f origin main")),
+      input: JSON.stringify(pre("mkfs.ext4 /dev/sda1")),
       encoding: "utf8",
       env: { HOME: bare, PATH: process.env.PATH, ACP_LOCAL: "1" },
       timeout: 15000,

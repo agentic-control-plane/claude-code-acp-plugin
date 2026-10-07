@@ -23,7 +23,6 @@ const FLOOR_DENY = [
   ["timeout", "5", RM, "-rf", "~"].join(" "),          // timeout's DURATION operand
   ["nice", "-n", "10", RM, "-rf", "/"].join(" "),      // nice's -n N operand
   ["nohup", "timeout", "2", RM, "-rf", "/"].join(" "), // stacked wrappers
-  "git -C . push --force origin main",                 // option-argument before subcommand
   ["(", RM, "-rf", "/", ")"].join(" "),                // subshell
   ["{", RM, "-rf", "/;", "}"].join(" "),               // brace group
   ["fish -c '", RM, "-rf /'"].join(" "),               // fish is a SHELL_BIN
