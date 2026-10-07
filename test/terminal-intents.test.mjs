@@ -147,6 +147,18 @@ const expansion = (overrides = {}) => ({
 });
 
 test("(a) /acp-enforce with no args files enforce with an empty target and blocks with describe/confirm/expiry", async () => {
+  // Gateway since gatewaystack-connect#1280: the link is EMAILED, never
+  // returned; `confirm` is legacy human text (no URL) for older plugins.
+  nextResponse = {
+    ok: true,
+    status: "sent",
+    to: "d***@example.com",
+    intentId: "11111111-2222-4333-8444-555555555555",
+    kind: "enforce",
+    describe: "File /acp-enforce: turn on the starter rules for this workspace.",
+    expiresInSeconds: 600,
+    confirm: "(emailed to d***@example.com — open that email and tap Confirm)",
+  };
   const out = await runHook(expansion());
   const req = seen.find((s) => s.url === "/plugin/intents");
   assert.ok(req, "expected a POST to /plugin/intents");
@@ -161,7 +173,26 @@ test("(a) /acp-enforce with no args files enforce with an empty target and block
   assert.ok(out, "expected output on stdout");
   assert.equal(out.decision, "block");
   assert.ok(out.reason.includes(nextResponse.describe), "reason should include the describe text");
-  assert.ok(out.reason.includes(nextResponse.confirm), "reason should include the confirm URL");
+  assert.match(out.reason, /Confirm link emailed to d\*\*\*@example\.com — open it and tap Confirm \(you, not the agent\)/);
+  assert.match(out.reason, /Expires in 10 min/);
+  assert.ok(!out.reason.includes("undefined"), "output must never contain 'undefined'");
+});
+
+test("(a2) an older gateway that returns the confirm link itself still gets it printed", async () => {
+  const out = await runHook(expansion());
+  assert.equal(out.decision, "block");
+  assert.ok(out.reason.includes(nextResponse.describe), "reason should include the describe text");
+  assert.ok(out.reason.includes(`Confirm (you, not the agent): ${nextResponse.confirm}`), "reason should include the confirm URL");
+  assert.ok(!out.reason.includes("emailed"), "legacy shape is not described as emailed");
+  assert.ok(!out.reason.includes("undefined"), "output must never contain 'undefined'");
+});
+
+test("(a3) a sent response with every optional field missing never prints 'undefined'", async () => {
+  nextResponse = { ok: true, status: "sent" };
+  const out = await runHook(expansion());
+  assert.equal(out.decision, "block");
+  assert.ok(!out.reason.includes("undefined"), `output must never contain 'undefined': ${out.reason}`);
+  assert.match(out.reason, /emailed to your account email/);
   assert.match(out.reason, /Expires in 10 min/);
 });
 
