@@ -122,7 +122,7 @@ const ACP_GOVERN = ACP_DEV_BASE ?? resolveAcpBase(
   process.env.ACP_GOVERN_BASE || process.env.ACP_API_BASE,
   "https://govern.agenticcontrolplane.com", acpBaseWarn);
 
-const PLUGIN_VERSION = "0.27.0";
+const PLUGIN_VERSION = "0.28.0";
 
 // Console base for user-facing deep links (session receipt, #606; enrolment
 // hint). Validated like the gateway bases: a poisoned value would otherwise
