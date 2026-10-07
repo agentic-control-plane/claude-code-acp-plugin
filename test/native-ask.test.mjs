@@ -169,6 +169,22 @@ test("(d) the same verdict maps to deny under codex", async () => {
   assert.equal(out.hookSpecificOutput?.permissionDecision, "deny");
 });
 
+test("(c2) a reason the gateway already branded is not prefixed again (gsc#1372)", async () => {
+  const branded = "ACP (Agentic Control Plane) asks: step_up by interactive tier policy for Bash.git.";
+  nextResponse = { decision: "ask", reason: branded, approval_id: "ap2", approval_status: "pending" };
+  const out = await runHook(preToolUse());
+  assert.ok(out, "expected output on stdout");
+  const dialog = out.hookSpecificOutput?.permissionDecisionReason ?? "";
+  assert.ok(dialog.startsWith(branded), `dialog should open with the gateway's own brand, got: ${dialog}`);
+  assert.doesNotMatch(dialog, /\[ACP\] Approval required:/);
+  assert.equal(out.systemMessage, branded);
+
+  // A reason that already carries the plugin's own tag is left alone too.
+  nextResponse = { decision: "ask", reason: "[ACP] already tagged", approval_id: "ap3", approval_status: "pending" };
+  const tagged = await runHook(preToolUse());
+  assert.equal(tagged.systemMessage, "[ACP] already tagged");
+});
+
 test("(e) PostToolUse never sends a capabilities field", async () => {
   await runHook(postToolUse());
   const req = seen.find((s) => s.url === "/govern/tool-output");

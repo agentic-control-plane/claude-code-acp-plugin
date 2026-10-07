@@ -1336,13 +1336,19 @@ async function handlePreToolUse() {
     const steer = decision === "deny"
       ? "Codex cannot ask mid-run, so this arrives as a block. A human approves it on the dashboard and the re-run passes under the grant — continue with the rest of your task meanwhile."
       : "A human is being asked now in this terminal. This holds ONE operation, not your task; if they say no, do not retry the same command — do something else or ask them.";
+    // Newer gateways brand the reason themselves ("ACP (Agentic Control
+    // Plane) asks: …", gsc#1372); prepend only for older ones so the dialog
+    // never shows a double prefix.
+    const headline = /^(?:ACP \(Agentic Control Plane\)|\[ACP\])/.test(reason)
+      ? reason
+      : `[ACP] Approval required: ${reason}`;
     process.stdout.write(JSON.stringify({
       hookSpecificOutput: {
         hookEventName: "PreToolUse",
         permissionDecision: decision,
-        permissionDecisionReason: `[ACP] Approval required: ${reason}\n\n${steer}`,
+        permissionDecisionReason: `${headline}\n\n${steer}`,
       },
-      systemMessage: `[ACP] Approval required: ${reason}`,
+      systemMessage: headline,
     }));
     process.exit(0);
   }
