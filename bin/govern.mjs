@@ -1,5 +1,67 @@
 #!/usr/bin/env node
 
+// ── What this file does to your machine ─────────────────────────────
+//
+// This is the Agentic Control Plane (ACP) hook. Your coding agent's harness
+// (Claude Code, Codex, Cursor, …) runs it before and after every tool call,
+// and at session start and end. You put it here by running the ACP installer
+// or `claude plugin install`. It is MIT-licensed; this copy is yours to read,
+// edit or delete. Each sentence below names the function you can check it against.
+//
+// WHAT LEAVES YOUR MACHINE. Before a tool call (handlePreToolUse) the hook
+// POSTs to https://govern.agenticcontrolplane.com: the tool's name and
+// arguments, your working directory, the session and call ids, the harness
+// name and hook version, the agent's tier and permission mode (detectAgentTier),
+// and — only when the call is a whole-file read (readContext) — the file's
+// path with its line and byte counts, never its contents. After the call
+// (handlePostToolUse) it sends the same plus the tool's OUTPUT, cut at 200 KB,
+// so the gateway can scan it; any lapses queued earlier in the session
+// (recordPendingLapse); and, from the harness transcript (collectTranscriptUsage),
+// each model turn's model name and token counts — not the prompt or reply text.
+// Your model prompts and completions never pass through this file; they reach
+// ACP only if you launch with a `*-acp` launcher. When you type an /acp-*
+// command (handleUserPromptExpansion) the command name and its argument go to
+// https://api.agenticcontrolplane.com and a confirm link comes back; the agent
+// never sees it. Your workspace key is read from ~/.acp/credentials (readToken).
+// With no key and a local policy (`install.sh --local`, runLocal) nothing here
+// touches the network. What the server keeps: agenticcontrolplane.com/trust.
+//
+// WHEN ACP IS UNREACHABLE OR YOUR KEY IS REJECTED (failPostureOnOutage,
+// failPostureOnKeyRejected): in an interactive session the call runs
+// ungoverned, a "[ACP] ⚠ UNGOVERNED" line is shown, and a row is appended to
+// ~/.acp/lapse.log. Unattended tiers (subagents, `claude -p`, CI) are denied
+// instead. The posture is fixed by tier; this file has no switch for it. The
+// two offline floors (applyOfflineFloors) still run in every case.
+//
+// CAN THIS BLOCK OR CHANGE WHAT YOUR AGENT DOES. Yes. A deny or ask from the
+// gateway (denyByPolicy, ask) stops or pauses the call; the gateway answers
+// deny/ask for policy rules only in enforce mode, and for its safety floors
+// (catastrophic commands, edits to the config that governs the agent) in any
+// mode. Offline, applyOfflineFloors denies catastrophic commands and asks
+// before force-pushes, pipe-to-shell, destructive SQL and recursive deletes
+// outside your project. For `gh` and GitHub calls it can prefix the command
+// with a short-lived ACP token (detectVendor, requestScopedToken); your own
+// credentials are never read. Calls the gateway did not see are buffered in
+// ~/.acp/ledger.jsonl (ledgerRecord: tool name, decision, working directory,
+// session id, the first 500 characters of the arguments) and uploaded once a
+// key is present (flushLedger).
+//
+// AT SESSION START (handleSessionStart) it sends one attestation: the sha256
+// of this file (sha256FileHex), the hook version, the session id and working
+// directory, and whether ~/.acp/harness-grants.json exists (and its hash). If
+// the ledger holds rows it also starts one detached `govern.mjs --flush`
+// (maybeSpawnFlush). It runs nothing else; an upgrade notice from the server
+// is printed, not acted on. At session end (handleStop) it prints a local
+// receipt line — no network.
+//
+// TO REMOVE IT: `acp-uninstall` (or `curl -sf https://agenticcontrolplane.com/uninstall.sh | bash`).
+// One command; everything you wrote yourself is kept. Do not delete this file
+// by hand while your harness config still points at it — every tool call then
+// prints a "Cannot find module" hook error until that entry is removed too.
+//
+// Policy, retention, what is stored: https://agenticcontrolplane.com/trust
+// ────────────────────────────────────────────────────────────────────
+
 // ACP Governance Hook — Pre- and Post-ToolUse interceptor
 //
 // Dispatches on input.hook_event_name:
