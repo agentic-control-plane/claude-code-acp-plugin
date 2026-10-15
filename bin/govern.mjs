@@ -1021,20 +1021,38 @@ function tierSignals() {
   return _tierDetection.signals;
 }
 
-// Tier-divergence notices (server flags client-reported ≠ enforced tier —
-// e.g. an attended session on a scoped API key) arrive on EVERY call for
-// the whole session; relay the first, dedupe the rest, same pattern as the
-// uncredentialed-session banner. The server's audit row is the durable
-// record — this marker only bounds terminal noise.
-function firstTierNoticeThisSession() {
-  const sessionId = String(input?.session_id ?? "unknown");
-  const marker = join(homedir(), ".acp", "tier-notice-session");
+// Pre-hook `notice` lines ride the same wire field whatever produced them:
+// a tier-divergence flag (#692), a trifecta shadow trigger (#768), a
+// shadow-mode counterfactual (#607). Some arrive on EVERY call for the
+// whole session, so the client dedupes — but per CLASS of notice, not one
+// notice per session: until 2026-10-15 a single session-wide marker meant
+// the first notice of any kind consumed the only slot, and the server's
+// 357 trifecta notices to the dogfood tenant were almost all dropped
+// here (gatewaystack-connect#1502). The server's audit row is the durable
+// record — this file only bounds terminal noise. Per-session file, one
+// class per line, capped so a chatty session still cannot flood.
+const PRE_NOTICE_CLASS_CAP = 4;
+function preNoticeClass(text) {
+  const t = String(text).trim();
+  if (/^\[ACP shadow\] Would have asked/.test(t)) return "trifecta";
+  const shadow = /^\[ACP shadow\] That was (\S+)/.exec(t);
+  if (shadow) return `shadow:${shadow[1]}`;
+  if (/tier divergence/i.test(t)) return "tier";
+  return `other:${t.replace(/\s+/g, " ").slice(0, 40)}`;
+}
+function firstNoticeOfClassThisSession(text) {
+  const sessionId = String(input?.session_id ?? "unknown").replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 120);
+  const cls = preNoticeClass(text);
+  const marker = join(NOTICE_DIR, `pre-${sessionId}`);
+  let seenClasses = [];
   try {
-    if (readFileSync(marker, "utf8").trim() === sessionId) return false;
+    seenClasses = readFileSync(marker, "utf8").split("\n").filter(Boolean);
   } catch { /* no marker yet */ }
+  if (seenClasses.includes(cls)) return false;
+  if (seenClasses.length >= PRE_NOTICE_CLASS_CAP) return false;
   try {
-    mkdirSync(join(homedir(), ".acp"), { recursive: true });
-    writeFileSync(marker, sessionId);
+    mkdirSync(NOTICE_DIR, { recursive: true });
+    writeFileSync(marker, [...seenClasses, cls].join("\n") + "\n");
   } catch { /* best-effort — at worst the notice repeats */ }
   return true;
 }
@@ -1510,11 +1528,12 @@ async function handlePreToolUse() {
     }
     // decision is allow (or unspecified) — continue to step 2.
     policyAllowed = true;
-    // Tier-divergence flag (#692): the server enforced a different tier
-    // than this client reported (never a deny by itself — the note rides
-    // on whatever the policy decided). Relay it once per session so the
-    // human learns the session's real tier without per-call spam.
-    if (typeof data.notice === "string" && data.notice.trim() && firstTierNoticeThisSession()) {
+    // Advisory `notice` on an allow (#692 tier divergence, #768 trifecta
+    // shadow, #607 counterfactual): never a deny by itself — the note rides
+    // on whatever the policy decided. Relay each CLASS once per session so
+    // the human learns about it without per-call spam, and so a tier flag
+    // does not silence a later trifecta notice (#1502).
+    if (typeof data.notice === "string" && data.notice.trim() && firstNoticeOfClassThisSession(data.notice)) {
       tierNotice = data.notice;
     }
     if (typeof data.warning === "string" && data.warning.trim()) {

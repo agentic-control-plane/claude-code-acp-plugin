@@ -167,6 +167,40 @@ test("the divergence notice is deduped within a session (flag once, not per call
   assert.match(JSON.parse(newSession.stdout).systemMessage, /tier divergence/);
 });
 
+// gatewaystack-connect#1502: the dedupe is per CLASS of notice, not one
+// notice per session. A tier flag on call 1 must not swallow a trifecta
+// shadow notice on call 2; the same class twice is still deduped.
+const TRIFECTA_NOTICE = "[ACP shadow] Would have asked before this call — prompt-injection trifecta: this session accessed private data (leg A — Bash.cat at 12:00:00Z) and took in untrusted external content (leg B — WebFetch at 12:00:05Z); this call (Bash.curl) can send data out (leg C). Nothing was blocked. To make this standing, queue a rule with acp_propose_rule.";
+test("a tier notice does not silence a later trifecta notice in the same session (per-class dedupe)", async () => {
+  nextResponse = { decision: "allow", notice: "[ACP] tier divergence: ..." };
+  const first = await hook(pre());
+  assert.match(JSON.parse(first.stdout).systemMessage, /tier divergence/);
+  nextResponse = { decision: "allow", notice: TRIFECTA_NOTICE };
+  const second = await hook(pre());
+  assert.match(JSON.parse(second.stdout).systemMessage, /Would have asked before this call/);
+  // Same class again: silent.
+  const third = await hook(pre());
+  assert.equal(third.stdout, "", "a second trifecta notice in the same session stays silent");
+  // And the tier class is still deduped too.
+  nextResponse = { decision: "allow", notice: "[ACP] tier divergence: ..." };
+  const fourth = await hook(pre());
+  assert.equal(fourth.stdout, "", "the tier notice does not come back");
+});
+
+test("shadow counterfactual notices dedupe per tool, and the per-session class cap holds", async () => {
+  const shown = [];
+  for (const tool of ["Bash.rm", "Bash.git", "Bash.curl", "Bash.ssh", "Bash.gh", "Bash.psql"]) {
+    nextResponse = { decision: "allow", notice: `[ACP shadow] That was ${tool} — would have been held. Nothing was blocked.` };
+    const res = await hook(pre());
+    if (res.stdout) shown.push(tool);
+  }
+  // Four distinct classes surface; the fifth and sixth hit the cap.
+  assert.deepEqual(shown, ["Bash.rm", "Bash.git", "Bash.curl", "Bash.ssh"]);
+  nextResponse = { decision: "allow", notice: "[ACP shadow] That was Bash.rm — would have been held. Nothing was blocked." };
+  const repeat = await hook(pre());
+  assert.equal(repeat.stdout, "", "a repeated class stays silent");
+});
+
 test("a policy deny still denies — the notice path never loosens enforcement", async () => {
   nextResponse = { decision: "deny", reason: "denied by api tier (scoped API key; session reported interactive) policy for Bash.echo" };
   const res = await hook(pre());
