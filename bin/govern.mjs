@@ -1274,7 +1274,7 @@ async function handlePreToolUse() {
   const WAIT_STEER =
     "This call is decided in the ACP console or from the approval email. Do what the reason says: call acp_wait_approval with that approval_id, retry the identical call only after it reports approved, and stop if it reports denied or timeout. Keep working on anything that does not need this call while you wait.";
   function denyByPolicy(reason, kind, verdict) {
-    rememberHeld(reason, kind);
+    rememberHeld(reason, kind, verdict?.judge);
     const held = approvalMeta(verdict);
     rememberPendingApproval(held);
     if (held) receiptVerdictHint = "held";
@@ -1404,7 +1404,7 @@ async function handlePreToolUse() {
     failPostureOnOutage(detail || "network error");
   }
   function ask(reason, verdict) {
-    rememberHeld(reason, "ask");
+    rememberHeld(reason, "ask", verdict?.judge);
     rememberPendingApproval(approvalMeta(verdict));
     // Codex has no ask semantic on the wire (see HARNESS note): emit deny
     // with the approval deep link so the human approves out-of-band and
@@ -2177,7 +2177,7 @@ function heldPath(sessionId) {
   return join(SESSION_STATS_DIR, `${safe}.held.json`);
 }
 
-function rememberHeld(reason, kind) {
+function rememberHeld(reason, kind, judge) {
   const sid = input.session_id;
   if (!sid || sid === "unknown") return;
   try {
@@ -2187,8 +2187,18 @@ function rememberHeld(reason, kind) {
       reason: String(reason ?? "").slice(0, 2000),
       kind: typeof kind === "string" ? kind : null,
       at: new Date().toISOString(),
+      // Judge layer (gatewaystack-connect#1492): the gateway's `judge`
+      // field on a held call — one line for /acp-why, kept verbatim.
+      ...(judge && typeof judge === "object" ? { judge: judgeSummary(judge) } : {}),
     }));
   } catch { /* bookkeeping must never touch the call path */ }
+}
+
+/** The subset of the wire `judge` field /acp-why prints; never free text. */
+function judgeSummary(j) {
+  const num = (v) => (typeof v === "number" && Number.isFinite(v) ? v : null);
+  const word = (v) => (typeof v === "string" ? v.replace(/[^A-Za-z0-9_-]/g, "").slice(0, 24) : "");
+  return { choice: word(j.choice), risk: word(j.risk), confidence: num(j.confidence), p: num(j.p), mode: j.mode === "applied" ? "applied" : "shadow" };
 }
 
 function readHeld(sessionId) {
@@ -2208,8 +2218,14 @@ function explainHeld(held) {
   const rule = /\b(?:denied|step_up|defer) by [^\n]{1,80}? policy for ([A-Za-z][A-Za-z0-9_.:-]{0,79})/.exec(held.reason);
   const review = /Review: (https:\/\/\S+)/.exec(held.reason);
   if (review) lines.push(`Approval: ${review[1]}`);
+  if (held.judge && held.judge.choice) {
+    const j = held.judge;
+    const p = typeof j.p === "number" ? ` (p=${j.p.toFixed(2)})` : "";
+    const c = typeof j.confidence === "number" ? `, confidence ${j.confidence.toFixed(2)}` : "";
+    lines.push(`  Judge said ${j.choice}${p}, risk ${j.risk || "unknown"}${c}, ${j.mode === "applied" ? "applied" : "shadow (recorded, not applied)"}.`);
+  }
   if (rule) {
-    lines.push(`A workspace rule on ${rule[1]} held it. /acp-allow ${rule[1]} stops holding it; /acp-status lists every rule.`);
+    lines.push(`A workspace rule on ${rule[1]} held it. /acp-allow ${rule[1]} stops holding it; /acp-judge ${rule[1]} lets the judge decide it; /acp-status lists every rule.`);
   } else if (/^\s*(hardline floor|governance surface|uninstall floor|destructive floor)\b/i.test(held.reason) || held.kind === "terminal") {
     lines.push("This is a safety floor, not a workspace rule; no command loosens it.");
   } else {
@@ -2547,7 +2563,7 @@ function handleSessionEnd() {
 // writes to the transcript. That is fine by design: the link executes only
 // the intent the human already typed, as that human, once, inside its TTL
 // — nothing a reader of the transcript can redirect.
-const INTENT_COMMAND_RE = /(?:^|:)acp-(enforce|audit|allow|ask|deny|apply|status|why|approve)$/;
+const INTENT_COMMAND_RE = /(?:^|:)acp-(enforce|audit|allow|ask|deny|judge|apply|status|why|approve)$/;
 
 function blockExpansion(reason) {
   process.stdout.write(JSON.stringify({ decision: "block", reason }));
@@ -2633,7 +2649,7 @@ async function handleUserPromptExpansion() {
           }).join("\n")
         : "";
       const next = s.mode === "enforce"
-        ? "/acp-allow <tool> stops the asking for one tool; /acp-audit records only."
+        ? "/acp-allow <tool> stops the asking for one tool; /acp-judge <tool> lets the judge decide it; /acp-audit records only."
         : "/acp-enforce turns the starter rules on so they ask first.";
       blockExpansion(`[ACP] ${s.workspace} is in ${s.mode} mode.\nInteractive rules:\n${rules}${proposals}${asks}${advice}\n${next}`);
     }

@@ -208,6 +208,32 @@ test("(b) /acp-allow target is only the first whitespace-separated token", async
   assert.equal(out.decision, "block");
 });
 
+test("(b2) /acp-judge <tool> files kind judge — the fourth per-tool value (gatewaystack-connect#1492)", async () => {
+  const out = await runHook(expansion({
+    command_name: "agentic-control-plane:acp-judge",
+    command_args: "Bash.git",
+  }));
+  const req = seen.find((s) => s.url === "/plugin/intents");
+  assert.ok(req, "expected a POST to /plugin/intents");
+  assert.equal(req.body.kind, "judge");
+  assert.equal(req.body.target, "Bash.git");
+  assert.equal(out.decision, "block");
+});
+
+test("(why) /acp-why prints the judge's verdict line when the held call carried one", async () => {
+  const sid = "sess-why-judge-1";
+  mkdirSync(join(HOME, ".acp", "session-stats"), { recursive: true });
+  writeFileSync(join(HOME, ".acp", "session-stats", `${sid}.held.json`), JSON.stringify({
+    tool: "Bash", reason: "step_up by interactive tier policy for Bash.git.push", kind: "ask", at: "2026-10-15T20:45:59.000Z",
+    judge: { choice: "allow", risk: "exfiltration", confidence: 0.8, p: 0.87, mode: "shadow" },
+  }));
+  const out = await runHook(expansion({ command_name: "agentic-control-plane:acp-why", command_args: "", session_id: sid }));
+  assert.equal(out.decision, "block");
+  assert.match(out.reason, /Judge said allow \(p=0\.87\), risk exfiltration, confidence 0\.80, shadow/);
+  assert.match(out.reason, /\/acp-judge Bash\.git\.push lets the judge decide it/);
+  assert.equal(seen.length, 0, "/acp-why makes no network call");
+});
+
 test("(c) /acp-status reads GET /plugin/intents/status and lists the mode + a proposal's /acp-apply hint", async () => {
   nextStatusResponse = {
     ok: true,
