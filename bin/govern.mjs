@@ -2194,11 +2194,14 @@ function rememberHeld(reason, kind, judge) {
   } catch { /* bookkeeping must never touch the call path */ }
 }
 
-/** The subset of the wire `judge` field /acp-why prints; never free text. */
+/** The subset of the wire `judge` field /acp-why prints; never free text.
+ *  Exactly what the gateway sends on an attended ask — choice, confidence,
+ *  mode — and nothing more, since this file is readable by the agent
+ *  (gatewaystack-connect#1492 review item 4). */
 function judgeSummary(j) {
   const num = (v) => (typeof v === "number" && Number.isFinite(v) ? v : null);
   const word = (v) => (typeof v === "string" ? v.replace(/[^A-Za-z0-9_-]/g, "").slice(0, 24) : "");
-  return { choice: word(j.choice), risk: word(j.risk), confidence: num(j.confidence), p: num(j.p), mode: j.mode === "applied" ? "applied" : "shadow" };
+  return { choice: word(j.choice), confidence: num(j.confidence), mode: j.mode === "applied" ? "applied" : "shadow" };
 }
 
 function readHeld(sessionId) {
@@ -2220,9 +2223,8 @@ function explainHeld(held) {
   if (review) lines.push(`Approval: ${review[1]}`);
   if (held.judge && held.judge.choice) {
     const j = held.judge;
-    const p = typeof j.p === "number" ? ` (p=${j.p.toFixed(2)})` : "";
-    const c = typeof j.confidence === "number" ? `, confidence ${j.confidence.toFixed(2)}` : "";
-    lines.push(`  Judge said ${j.choice}${p}, risk ${j.risk || "unknown"}${c}, ${j.mode === "applied" ? "applied" : "shadow (recorded, not applied)"}.`);
+    const c = typeof j.confidence === "number" ? `, confidence ${j.confidence.toFixed(1)}` : "";
+    lines.push(`  Judge said ${j.choice}${c}, ${j.mode === "applied" ? "applied" : "shadow (recorded, not applied)"}.`);
   }
   if (rule) {
     lines.push(`A workspace rule on ${rule[1]} held it. /acp-allow ${rule[1]} stops holding it; /acp-judge ${rule[1]} lets the judge decide it; /acp-status lists every rule.`);
