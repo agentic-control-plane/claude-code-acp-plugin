@@ -208,6 +208,53 @@ test("(b) /acp-allow target is only the first whitespace-separated token", async
   assert.equal(out.decision, "block");
 });
 
+test("(b2) /acp-judge <tool> files kind judge — the fourth per-tool value (gatewaystack-connect#1492)", async () => {
+  const out = await runHook(expansion({
+    command_name: "agentic-control-plane:acp-judge",
+    command_args: "Bash.git",
+  }));
+  const req = seen.find((s) => s.url === "/plugin/intents");
+  assert.ok(req, "expected a POST to /plugin/intents");
+  assert.equal(req.body.kind, "judge");
+  assert.equal(req.body.target, "Bash.git");
+  assert.equal(out.decision, "block");
+});
+
+test("(why) /acp-why prints the judge's verdict line when the held call carried one", async () => {
+  const sid = "sess-why-judge-1";
+  mkdirSync(join(HOME, ".acp", "session-stats"), { recursive: true });
+  writeFileSync(join(HOME, ".acp", "session-stats", `${sid}.held.json`), JSON.stringify({
+    tool: "Bash", reason: "step_up by interactive tier policy for Bash.git.push", kind: "ask", at: "2026-10-15T20:45:59.000Z",
+    // An older or tampered file may carry more than the wire does now; only
+    // choice, confidence and mode are ever printed (review item 4).
+    judge: { choice: "allow", risk: "exfiltration", confidence: 0.8, p: 0.87, mode: "shadow" },
+  }));
+  const out = await runHook(expansion({ command_name: "agentic-control-plane:acp-why", command_args: "", session_id: sid }));
+  assert.equal(out.decision, "block");
+  assert.match(out.reason, /Judge said allow, confidence 0\.8, shadow \(recorded, not applied\)/);
+  assert.doesNotMatch(out.reason, /exfiltration|p=0\.87|risk/);
+  assert.match(out.reason, /\/acp-judge Bash\.git\.push lets the judge decide it/);
+  assert.equal(seen.length, 0, "/acp-why makes no network call");
+});
+
+test("(why2) a held ask stores only choice, confidence and mode from the wire judge field (review item 4)", async () => {
+  // Drive the PreToolUse path against the stub: the gateway's ask carries a
+  // judge field with extra keys; the held-call file must not keep them.
+  const sid = "sess-why-judge-2";
+  nextResponse = {
+    decision: "ask",
+    reason: "ACP (Agentic Control Plane) asks: Run `git push` · rule Bash.git.push · yes = run once · /acp-allow Bash.git.push",
+    approval_id: "ap-why2", approval_status: "pending", approval_code: "AB12",
+    judge: { choice: "allow", confidence: 0.8, mode: "shadow", risk: "exfiltration", p: 0.87, reason: "should not persist" },
+  };
+  await runHook({
+    hook_event_name: "PreToolUse", session_id: sid, tool_name: "Bash", tool_input: { command: "git push origin main" },
+  }).catch(() => null);
+  const { readFileSync } = await import("node:fs");
+  const held = JSON.parse(readFileSync(join(HOME, ".acp", "session-stats", `${sid}.held.json`), "utf8"));
+  assert.deepEqual(held.judge, { choice: "allow", confidence: 0.8, mode: "shadow" });
+});
+
 test("(c) /acp-status reads GET /plugin/intents/status and lists the mode + a proposal's /acp-apply hint", async () => {
   nextStatusResponse = {
     ok: true,
