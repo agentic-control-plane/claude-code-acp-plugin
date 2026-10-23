@@ -103,7 +103,7 @@ If you haven't connected the vendor yet, the plugin emits a deny with a clickabl
 
 If your workspace doesn't have scoped tokens enabled, the plugin behaves exactly as v0.4.0 did — your existing local credentials continue to work unchanged.
 
-Other vendors (Slack, Salesforce, Notion, etc.) ship in subsequent releases. Track progress at [gatewaystack-connect#114](https://github.com/davidcrowe/gatewaystack-connect/issues/114).
+Other vendors (Slack, Salesforce, Notion, etc.) ship in subsequent releases; watch this repo's [releases](https://github.com/agentic-control-plane/claude-code-acp-plugin/releases) or ask in [issues](https://github.com/agentic-control-plane/claude-code-acp-plugin/issues).
 
 ## What you get
 
@@ -148,4 +148,5 @@ claude plugin disable agentic-control-plane
 ## Support
 
 - Site: https://agenticcontrolplane.com
-- Issues: https://github.com/davidcrowe/claude-code-acp-plugin/issues
+- Issues: https://github.com/agentic-control-plane/claude-code-acp-plugin/issues
+- Email: support@agenticcontrolplane.com
