@@ -388,9 +388,23 @@ test("(i) /acp-why with an approval hold prints the approval link", async () => 
   assert.match(out.reason, /Approval: https:\/\/cloud\.agenticcontrolplane\.com\/approvals\?id=0b3c7a52/);
 });
 
-test("(j) /acp-why with nothing held says so", async () => {
+test("(j) /acp-why with nothing held says so and points at other sessions' holds", async () => {
   const out = await runHook(expansion({ command_name: "agentic-control-plane:acp-why", session_id: "sess-never-held" }));
   assert.match(out.reason, /Nothing has been held in this session/);
+  assert.match(out.reason, /\/acp-approve lists calls waiting from your other sessions/);
+});
+
+test("(j2) /acp-why on a fatigue-cap deny names the way out, not a rule", async () => {
+  nextResponse = {
+    decision: "deny",
+    reason: "approval-fatigue-cap: — 5 held calls in the last 10 min are unanswered. Stop and tell the human: /acp-approve lists them. Rule: your rule: ask before Bash.git.fetch.",
+    kind: "delegate",
+  };
+  await runHook(preToolUse({ session_id: "sess-why-fatigue" }));
+  const out = await runHook(expansion({ command_name: "agentic-control-plane:acp-why", session_id: "sess-why-fatigue" }));
+  assert.match(out.reason, /ACP stopped asking because earlier approvals are still unanswered/);
+  assert.match(out.reason, /\/acp-approve lists them to approve or deny/);
+  assert.ok(!/\/acp-allow/.test(out.reason.split("\n").slice(2).join("\n")), "no rule advice for a cap");
 });
 
 test("(k) /acp-status lists each pending approval with its own link", async () => {

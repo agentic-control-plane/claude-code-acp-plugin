@@ -2244,7 +2244,7 @@ function readHeld(sessionId) {
 /** The lines /acp-why prints: what was held, why, and what changes it. */
 function explainHeld(held) {
   if (!held || !held.reason) {
-    return "[ACP] Nothing has been held in this session.";
+    return "[ACP] Nothing has been held in this session. /acp-approve lists calls waiting from your other sessions.";
   }
   const clean = (v) => String(v ?? "").replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g, " ");
   const lines = [`[ACP] Last held call${held.tool ? ` (${clean(held.tool)})` : ""} at ${clean(held.at)}:`, `  ${clean(held.reason)}`];
@@ -2258,6 +2258,12 @@ function explainHeld(held) {
     const j = held.judge;
     const c = typeof j.confidence === "number" ? `, confidence ${j.confidence.toFixed(1)}` : "";
     lines.push(`  Judge said ${j.choice}${c}, ${j.mode === "applied" ? "applied" : "shadow (recorded, not applied)"}.`);
+  }
+  // The cap is not a rule on this tool: too many earlier asks are still
+  // unanswered, so the gateway stopped asking. Answering them is the way out.
+  if (/^\s*approval-fatigue-cap:/.test(held.reason)) {
+    lines.push("ACP stopped asking because earlier approvals are still unanswered. /acp-approve lists them to approve or deny; answering them, or waiting out the window, lifts it. /acp-status lists every rule.");
+    return lines.join("\n");
   }
   if (rule) {
     lines.push(`A workspace rule on ${rule[1]} held it. /acp-allow ${rule[1]} stops holding it; /acp-judge ${rule[1]} lets the judge decide it; /acp-status lists every rule.`);
