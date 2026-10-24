@@ -127,7 +127,7 @@ const ACP_GOVERN = ACP_DEV_BASE ?? resolveAcpBase(
 // beside it. Agreement with plugin.json / marketplace.json is enforced by
 // scripts/validate-manifest.mjs and test/plugin-version.test.mjs
 // (gatewaystack-connect#1538 item 6).
-const PLUGIN_VERSION = "0.29.2";
+const PLUGIN_VERSION = "0.29.3";
 
 // Console base for user-facing deep links (session receipt, #606; enrolment
 // hint). Validated like the gateway bases: a poisoned value would otherwise
@@ -179,6 +179,21 @@ function recordPendingLapse(sessionId, toolName, detail) {
     });
     writeFileSync(lapsePendingPath(sessionId), JSON.stringify(list.slice(-LAPSE_PENDING_CAP)));
   } catch { /* best-effort — lapse.log is the durable record */ }
+}
+
+// True the first time it is asked for a session, false after. Fails toward
+// showing the notice: an unwritable marker means it repeats, not vanishes.
+const DELETED_NOTICE_DIR = join(homedir(), ".acp", "notices");
+function firstDeletedNoticeThisSession(sessionId) {
+  const id = String(sessionId ?? "").replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 120);
+  if (!id || id === "unknown") return true;
+  try {
+    mkdirSync(DELETED_NOTICE_DIR, { recursive: true });
+    writeFileSync(join(DELETED_NOTICE_DIR, `workspace-deleted.${id}`), new Date().toISOString(), { flag: "wx" });
+    return true;
+  } catch (e) {
+    return e?.code !== "EEXIST";
+  }
 }
 
 function clearPendingLapse(sessionId) {
@@ -1372,9 +1387,16 @@ async function handlePreToolUse() {
   // visit the console. Same tier posture as an outage (interactive fails
   // open, unattended stays blocked), but the message names the cause and
   // the two fixes.
-  function failPostureOnKeyRejected(status) {
+  // `code: "workspace_deleted"` (gateway, 2026-10-24): the owner deleted the
+  // workspace on purpose. A deleted user's machine repeated KEY REJECTED on
+  // 1,745+ calls over three weeks. Say once per session what happened and
+  // how to remove the hooks; the tier posture below is unchanged.
+  function failPostureOnKeyRejected(status, code) {
     const tier = resolveAgentTier();
-    const fix = "Fix: re-run the installer (curl -sf https://agenticcontrolplane.com/install.sh | bash) or create a key at https://cloud.agenticcontrolplane.com/settings/api-keys and save it: echo 'gsk_...' > ~/.acp/credentials";
+    const deleted = code === "workspace_deleted";
+    const fix = deleted
+      ? "The ACP workspace this machine was connected to has been deleted. To remove ACP from this machine: bash ~/.acp/uninstall.sh (or curl -sf https://agenticcontrolplane.com/uninstall.sh | bash). To keep using ACP, re-run the installer: curl -sf https://agenticcontrolplane.com/install.sh | bash"
+      : "Fix: re-run the installer (curl -sf https://agenticcontrolplane.com/install.sh | bash) or create a key at https://cloud.agenticcontrolplane.com/settings/api-keys and save it: echo 'gsk_...' > ~/.acp/credentials";
     if (applyOfflineFloors(input, "key-rejected")) process.exit(0);
     ledgerRecord(input, { decision: tier === "interactive" ? "allow" : "deny", source: tier === "interactive" ? "ungoverned" : "fail-closed", reason: `key rejected (HTTP ${status})`, mode: "key-rejected" });
     if (tier === "interactive") {
@@ -1383,6 +1405,10 @@ async function handlePreToolUse() {
           JSON.stringify({ at: new Date().toISOString(), tool: input.tool_name, tier, detail: `key rejected (HTTP ${status})` }) + "\n");
       } catch { /* best-effort */ }
       recordPendingLapse(input.session_id, input.tool_name, `key rejected (HTTP ${status})`);
+      if (deleted && !firstDeletedNoticeThisSession(input.session_id)) {
+        process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "allow" } }));
+        process.exit(0);
+      }
       process.stdout.write(JSON.stringify({
         hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "allow" },
         systemMessage: `[ACP] ⚠ KEY REJECTED (HTTP ${status}): the key in ~/.acp/credentials is revoked or invalid — this call proceeded UNGOVERNED and unlogged, and every call will until it is fixed. ${fix}`,
@@ -1400,8 +1426,8 @@ async function handlePreToolUse() {
     }));
     process.exit(0);
   }
-  function denyGatewayError(status, statusText) {
-    if (status === 401 || status === 403) { failPostureOnKeyRejected(status); return; }
+  function denyGatewayError(status, statusText, code) {
+    if (status === 401 || status === 403) { failPostureOnKeyRejected(status, code); return; }
     const detail = statusText ? `HTTP ${status} ${statusText}` : `HTTP ${status}`;
     failPostureOnOutage(detail);
   }
@@ -1503,8 +1529,10 @@ async function handlePreToolUse() {
       // rate limits were simply unenforced — while unattended tiers denied
       // with a misleading "gateway unreachable" message. 5xx and bodyless
       // 4xx (e.g. the auth guard's 401) keep the outage posture.
+      let code;
       if (res.status >= 400 && res.status < 500) {
         const verdict = await res.json().catch(() => null);
+        code = typeof verdict?.code === "string" ? verdict.code : undefined;
         if (verdict && (verdict.decision === "deny" || verdict.decision === "ask")) {
           recoveryLine = checkOutageRecovery();
         }
@@ -1517,7 +1545,7 @@ async function handlePreToolUse() {
           return;
         }
       }
-      denyGatewayError(res.status, res.statusText);
+      denyGatewayError(res.status, res.statusText, code);
       return;
     }
     const data = await res.json();
