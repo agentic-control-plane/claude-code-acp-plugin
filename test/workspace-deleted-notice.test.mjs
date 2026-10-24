@@ -59,7 +59,8 @@ test("workspace_deleted: interactive session gets ONE notice naming the deletion
     const first = await runHook(base, { home });
     assert.equal(first.decision, "allow");
     assert.match(first.message, /workspace this machine was connected to has been deleted/);
-    assert.match(first.message, /uninstall\.sh/);
+    assert.match(first.message, /acp-uninstall/);
+    assert.match(first.message, /uninstall\.sh \| bash/);
     const second = await runHook(base, { home });
     assert.equal(second.decision, "allow");
     assert.equal(second.message, "");

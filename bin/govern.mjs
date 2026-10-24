@@ -1395,7 +1395,7 @@ async function handlePreToolUse() {
     const tier = resolveAgentTier();
     const deleted = code === "workspace_deleted";
     const fix = deleted
-      ? "The ACP workspace this machine was connected to has been deleted. To remove ACP from this machine: bash ~/.acp/uninstall.sh (or curl -sf https://agenticcontrolplane.com/uninstall.sh | bash). To keep using ACP, re-run the installer: curl -sf https://agenticcontrolplane.com/install.sh | bash"
+      ? "The ACP workspace this machine was connected to has been deleted. To remove ACP from this machine: acp-uninstall (older installs without it: curl -sf https://agenticcontrolplane.com/uninstall.sh | bash). To keep using ACP, re-run the installer: curl -sf https://agenticcontrolplane.com/install.sh | bash"
       : "Fix: re-run the installer (curl -sf https://agenticcontrolplane.com/install.sh | bash) or create a key at https://cloud.agenticcontrolplane.com/settings/api-keys and save it: echo 'gsk_...' > ~/.acp/credentials";
     if (applyOfflineFloors(input, "key-rejected")) process.exit(0);
     ledgerRecord(input, { decision: tier === "interactive" ? "allow" : "deny", source: tier === "interactive" ? "ungoverned" : "fail-closed", reason: `key rejected (HTTP ${status})`, mode: "key-rejected" });
