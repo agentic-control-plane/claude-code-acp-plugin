@@ -95,7 +95,7 @@ test("SessionStart with four notices at once (ledger upload, upgrade, stale hook
     assert.match(out.systemMessage, /A newer ACP hook is available \(v99\.0\.0; this is v\d+\.\d+\.\d+\)\. Update: /, "stale-hook line reaches the human");
     assert.match(out.systemMessage, /1 tool call recorded while ACP could not see/, "ledger-upload notice reaches the human");
     assert.match(out.systemMessage, /Turn it on: \/acp-enforce/, "daily offer reaches the human");
-    assert.match(out.systemMessage, /^.*\nACP: recording · always blocked: rm -rf ~, disk wipes · \/acp-status for your mode and rules\n/m, "state line reaches the human, after the ledger line");
+    assert.match(out.systemMessage, /^.*\n\[ACP\] recording · always blocked: rm -rf ~, disk wipes · \/acp-status for your mode and rules\n/m, "state line reaches the human, after the ledger line");
     assert.ok(out.systemMessage.includes("\n"), "human notices are joined by newlines");
     assert.ok(gw.received.some((x) => x.url === "/govern/attest"), "attestation still happens");
   } finally {
@@ -124,7 +124,7 @@ test("SessionStart with only the ledger-upload notice writes one systemMessage o
 // short form, saying only what is true for this tenant. Today's gateway
 // sends no mode or floor stage on /govern/attest, so the hook says what
 // every tenant has in every mode and points at /acp-status for the rest.
-const STATE_UNKNOWN = "ACP: recording · always blocked: rm -rf ~, disk wipes · /acp-status for your mode and rules";
+const STATE_UNKNOWN = "[ACP] recording · always blocked: rm -rf ~, disk wipes · /acp-status for your mode and rules";
 
 test("SessionStart with nothing else to say writes the one state line, and a re-fired SessionStart for the same session writes nothing", async () => {
   const home = freshHome();
@@ -150,7 +150,7 @@ test("SessionStart renders the audit form from gateway mode, adding the asks-fir
   const gw = await fakeGateway({ ok: true, verdict: "attested", mode: "audit" });
   try {
     const out = parseOne((await sessionStart(home, gw.port)).stdout);
-    assert.equal(out.systemMessage, "ACP: audit — recording · always blocked: rm -rf ~, disk wipes · /acp-enforce to apply your rules");
+    assert.equal(out.systemMessage, "[ACP] audit — recording · always blocked: rm -rf ~, disk wipes · /acp-enforce to apply your rules");
   } finally {
     gw.server.close();
     rmSync(home, { recursive: true, force: true });
@@ -159,7 +159,7 @@ test("SessionStart renders the audit form from gateway mode, adding the asks-fir
   const gw2 = await fakeGateway({ ok: true, verdict: "attested", mode: "audit", floor_asks_first: true });
   try {
     const out = parseOne((await sessionStart(home2, gw2.port)).stdout);
-    assert.equal(out.systemMessage, "ACP: audit — recording · always blocked: rm -rf ~, disk wipes · asks first: force-push, DROP, curl|sh · /acp-enforce to apply your rules");
+    assert.equal(out.systemMessage, "[ACP] audit — recording · always blocked: rm -rf ~, disk wipes · asks first: force-push, DROP, curl|sh · /acp-enforce to apply your rules");
   } finally {
     gw2.server.close();
     rmSync(home2, { recursive: true, force: true });
@@ -171,7 +171,7 @@ test("SessionStart renders the enforce form with the rule count when the gateway
   const gw = await fakeGateway({ ok: true, verdict: "attested", mode: "enforce", rules: 3 });
   try {
     const out = parseOne((await sessionStart(home, gw.port)).stdout);
-    assert.equal(out.systemMessage, "ACP: enforce — 3 rules apply · plus the safety floor · /acp-status");
+    assert.equal(out.systemMessage, "[ACP] enforce — 3 rules apply · plus the safety floor · /acp-status");
   } finally {
     gw.server.close();
     rmSync(home, { recursive: true, force: true });
@@ -180,16 +180,16 @@ test("SessionStart renders the enforce form with the rule count when the gateway
   const gw2 = await fakeGateway({ ok: true, verdict: "attested", mode: "enforce" });
   try {
     const out = parseOne((await sessionStart(home2, gw2.port)).stdout);
-    assert.equal(out.systemMessage, "ACP: enforce — your rules apply · plus the safety floor · /acp-status");
+    assert.equal(out.systemMessage, "[ACP] enforce — your rules apply · plus the safety floor · /acp-status");
   } finally {
     gw2.server.close();
     rmSync(home2, { recursive: true, force: true });
   }
   const home3 = freshHome();
-  const gw3 = await fakeGateway({ ok: true, verdict: "attested", mode: "audit", state_line: "ACP: audit — recording · 2 rules waiting\u0007 · /acp-enforce" });
+  const gw3 = await fakeGateway({ ok: true, verdict: "attested", mode: "audit", state_line: "[ACP] audit — recording · 2 rules waiting\u0007 · /acp-enforce" });
   try {
     const out = parseOne((await sessionStart(home3, gw3.port)).stdout);
-    assert.equal(out.systemMessage, "ACP: audit — recording · 2 rules waiting  · /acp-enforce", "gateway line is used verbatim, control characters stripped");
+    assert.equal(out.systemMessage, "[ACP] audit — recording · 2 rules waiting  · /acp-enforce", "gateway line is used verbatim, control characters stripped");
   } finally {
     gw3.server.close();
     rmSync(home3, { recursive: true, force: true });

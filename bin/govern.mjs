@@ -966,7 +966,7 @@ async function runLocal(input) {
   if (ev === "SessionStart") {
     if (onceThisSession("state")) {
       process.stdout.write(JSON.stringify({
-        systemMessage: `ACP: local — your rules in ~/.acp/policy.json apply · ${STATE_BLOCKED} · ${STATE_ASKS}`,
+        systemMessage: `[ACP] local — your rules in ~/.acp/policy.json apply · ${STATE_BLOCKED} · ${STATE_ASKS}`,
       }));
     }
     return;
@@ -2183,12 +2183,12 @@ function sessionStateLine(data) {
       const n = Number.isInteger(data.rules) && data.rules >= 0
         ? `${data.rules} rule${data.rules === 1 ? "" : "s"} apply`
         : "your rules apply";
-      return `ACP: enforce — ${n} · plus the safety floor · /acp-status`;
+      return `[ACP] enforce — ${n} · plus the safety floor · /acp-status`;
     }
     if (mode === "audit") {
-      return ["ACP: audit — recording", STATE_BLOCKED, ...(data.floor_asks_first === true ? [STATE_ASKS] : []), "/acp-enforce to apply your rules"].join(" · ");
+      return ["[ACP] audit — recording", STATE_BLOCKED, ...(data.floor_asks_first === true ? [STATE_ASKS] : []), "/acp-enforce to apply your rules"].join(" · ");
     }
-    return `ACP: recording · ${STATE_BLOCKED} · /acp-status for your mode and rules`;
+    return `[ACP] recording · ${STATE_BLOCKED} · /acp-status for your mode and rules`;
   } catch { return null; }
 }
 
