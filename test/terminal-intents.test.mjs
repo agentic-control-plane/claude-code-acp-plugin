@@ -406,3 +406,33 @@ test("(k) /acp-status lists each pending approval with its own link", async () =
   assert.match(out.reason, /Bash\.git-push {2}https:\/\/cloud\.agenticcontrolplane\.com\/approvals\?id=a1/);
   assert.ok(!out.reason.includes("javascript:"), "only https links are printed");
 });
+
+// gatewaystack-connect#1538 item 5: the /acp-enforce hint only shows where
+// the command can run (audit mode AND terminal_intents on for the tenant).
+const ENFORCE_HINT = "/acp-enforce turns the starter rules on";
+const statusOf = (over) => ({ ok: true, workspace: "acme", rules: [], proposals: [], pendingApprovals: [], ...over });
+const runStatus = () => runHook(expansion({ command_name: "agentic-control-plane:acp-status", command_args: "" }));
+
+test("(c3) /acp-status prints the enforce hint only in audit mode with terminal_intents on", async () => {
+  nextStatusResponse = statusOf({ mode: "audit", terminalIntents: true });
+  const on = await runStatus();
+  assert.ok(on.reason.includes(ENFORCE_HINT));
+});
+
+test("(c4) /acp-status omits the enforce hint when terminal_intents is off or not reported, mode line still printed", async () => {
+  for (const extra of [{ terminalIntents: false }, {}]) {
+    nextStatusResponse = statusOf({ mode: "audit", ...extra });
+    const out = await runStatus();
+    assert.match(out.reason, /^\[ACP\] acme is in audit mode\./);
+    assert.ok(!out.reason.includes(ENFORCE_HINT), `no hint for ${JSON.stringify(extra)}`);
+    assert.ok(!out.reason.includes("/acp-allow <tool>"), "no enforce-mode hint either");
+  }
+});
+
+test("(c5) /acp-status in enforce mode never offers /acp-enforce, even with terminal_intents on", async () => {
+  nextStatusResponse = statusOf({ mode: "enforce", terminalIntents: true });
+  const out = await runStatus();
+  assert.match(out.reason, /^\[ACP\] acme is in enforce mode\./);
+  assert.ok(!out.reason.includes(ENFORCE_HINT));
+  assert.ok(out.reason.includes("/acp-allow <tool>"));
+});
