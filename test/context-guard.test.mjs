@@ -11,6 +11,7 @@
 // measurement (line counting) and the wire shape are exercised too.
 
 import { test, before, after, describe } from "node:test";
+import "./_dev-base.mjs";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, writeFileSync, copyFileSync, readFileSync, rmSync, existsSync } from "node:fs";
