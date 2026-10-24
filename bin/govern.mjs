@@ -1353,14 +1353,16 @@ async function handlePreToolUse() {
     const held = approvalMeta(verdict);
     rememberPendingApproval(held);
     if (held) receiptVerdictHint = "held";
-    const steer =/\bacp_wait_approval\b/.test(reason) ? WAIT_STEER : STEER_BY_KIND[kind]
-      || (UNPROPOSABLE.test(reason) ? STEER_BY_KIND.terminal : STEER_BY_KIND.reformulate);
     // A rate-limit deny is capacity, not a rule (gsc#1699 ws2 item 1): no
     // human can allow or fix it, so it must not read "Denied by policy".
     // The gateway types it kind:"retry"; the reason text is the fallback
-    // for a gateway older than the typed field. The model keeps the retry
-    // steer above, verbatim.
+    // for a gateway older than the typed field — and that fallback used to
+    // fall through to the "propose a rule" steer, sending the agent to file
+    // a rule against a rate limit. Busy always carries the retry steer.
     const busy = kind === "retry" || (kind == null && /\brate.?limit/i.test(reason));
+    const steer = /\bacp_wait_approval\b/.test(reason) ? WAIT_STEER
+      : busy ? STEER_BY_KIND.retry
+      : STEER_BY_KIND[kind] || (UNPROPOSABLE.test(reason) ? STEER_BY_KIND.terminal : STEER_BY_KIND.reformulate);
     const humanLine = busy
       ? "[ACP] Busy — too many calls at once; retrying this call is safe."
       : `[ACP] Denied by policy: ${reason}`;
