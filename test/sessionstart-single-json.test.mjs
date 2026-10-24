@@ -159,7 +159,7 @@ test("SessionStart renders the audit form from gateway mode, adding the asks-fir
   const gw2 = await fakeGateway({ ok: true, verdict: "attested", mode: "audit", floor_asks_first: true });
   try {
     const out = parseOne((await sessionStart(home2, gw2.port)).stdout);
-    assert.equal(out.systemMessage, "[ACP] audit — recording · always blocked: rm -rf ~, disk wipes · asks first: force-push, DROP, curl|sh · /acp-enforce to apply your rules");
+    assert.equal(out.systemMessage, "[ACP] audit — recording · always blocked: rm -rf ~, disk wipes · held for your OK: force-push, DROP, curl|sh · /acp-enforce to apply your rules");
   } finally {
     gw2.server.close();
     rmSync(home2, { recursive: true, force: true });

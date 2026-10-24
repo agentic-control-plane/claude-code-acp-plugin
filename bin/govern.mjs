@@ -503,7 +503,7 @@ const INSTALL_CMD = "curl -sf https://agenticcontrolplane.com/install.sh | bash"
 // Safety-floor clauses of the copy-contract short form (gsc#1699): the two
 // tiers, in the words every ACP surface uses.
 const STATE_BLOCKED = "always blocked: rm -rf ~, disk wipes";
-const STATE_ASKS = "asks first: force-push, DROP, curl|sh";
+const STATE_ASKS = "held for your OK: force-push, DROP, curl|sh";
 // Prune the session-notice directory so it cannot grow without bound: drop
 // markers past the TTL, and never keep more than NOTICE_MAX_FILES (newest
 // win). Opportunistic — every failure is swallowed.

@@ -80,7 +80,7 @@ test("SessionStart: one state line per session naming both floor tiers; a re-fir
   const start = { hook_event_name: "SessionStart", session_id: "local-state-1", cwd: "/work" };
   const out = hook(start);
   assert.deepEqual(out, {
-    systemMessage: "[ACP] local — your rules in ~/.acp/policy.json apply · always blocked: rm -rf ~, disk wipes · asks first: force-push, DROP, curl|sh",
+    systemMessage: "[ACP] local — your rules in ~/.acp/policy.json apply · always blocked: rm -rf ~, disk wipes · held for your OK: force-push, DROP, curl|sh",
   });
   assert.equal(hook(start), null, "same session: silent");
   assert.ok(!auditLines().some((l) => l.event === "pre" && l.tool === undefined), "no audit row for a session start");
