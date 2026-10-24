@@ -14,6 +14,15 @@ import { join } from "node:path";
 
 let scratchHome;
 
+// Every spawned process preloads _no-prod-fetch.mjs, so a test can never
+// reach a real gateway even if it forgets the override below.
+const NO_PROD = `--import=${new URL("./_no-prod-fetch.mjs", import.meta.url).href}`;
+function withNoProd(nodeOptions) {
+  const cur = String(nodeOptions ?? "");
+  return cur.includes(NO_PROD) ? cur : `${cur} ${NO_PROD}`.trim();
+}
+process.env.NODE_OPTIONS = withNoProd(process.env.NODE_OPTIONS);
+
 // Write the override file into `home` and return the env entries to spread.
 export function devBase(home, url) {
   mkdirSync(join(home, ".acp"), { recursive: true });
@@ -23,7 +32,12 @@ export function devBase(home, url) {
 
 function prep(args) {
   const i = args.findIndex((a) => a && typeof a === "object" && !Array.isArray(a) && a.env);
-  if (i < 0 || args[i].env.ACP_TEST_DEV_BASE !== "1") return args;
+  if (i < 0) return args;
+  if (args[i].env.ACP_TEST_DEV_BASE !== "1") {
+    const out = args.slice();
+    out[i] = { ...args[i], env: { ...args[i].env, NODE_OPTIONS: withNoProd(args[i].env.NODE_OPTIONS) } };
+    return out;
+  }
   const { ACP_TEST_DEV_BASE, ACP_GOVERN_BASE, ACP_API_BASE, ...env } = args[i].env;
   const url = ACP_GOVERN_BASE || ACP_API_BASE;
   if (!url) throw new Error("ACP_TEST_DEV_BASE=1 needs ACP_GOVERN_BASE or ACP_API_BASE");
@@ -32,6 +46,7 @@ function prep(args) {
     env.HOME = scratchHome;
   }
   Object.assign(env, devBase(env.HOME, url));
+  env.NODE_OPTIONS = withNoProd(env.NODE_OPTIONS);
   const out = args.slice();
   out[i] = { ...args[i], env };
   return out;

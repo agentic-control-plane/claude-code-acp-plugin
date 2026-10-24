@@ -9,6 +9,7 @@
 // — including LOCAL mode — must not satisfy the gate.
 
 import { test, before, after } from "node:test";
+import "./_dev-base.mjs";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, writeFileSync, copyFileSync, readFileSync, rmSync, existsSync } from "node:fs";

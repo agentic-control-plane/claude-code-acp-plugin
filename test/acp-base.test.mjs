@@ -5,6 +5,7 @@
 // is the dev/test override FILE ~/.acp/dev_base_override. There is no
 // self-host escape hatch: ACP_SELF_HOST in the environment is just noise.
 import test from "node:test";
+import "./_dev-base.mjs";
 import assert from "node:assert/strict";
 import { readFileSync, mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { spawn, spawnSync } from "node:child_process";
