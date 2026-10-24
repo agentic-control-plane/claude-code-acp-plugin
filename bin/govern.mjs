@@ -122,7 +122,12 @@ const ACP_GOVERN = ACP_DEV_BASE ?? resolveAcpBase(
   process.env.ACP_GOVERN_BASE || process.env.ACP_API_BASE,
   "https://govern.agenticcontrolplane.com", acpBaseWarn);
 
-const PLUGIN_VERSION = "0.29.0";
+// Must stay a literal: install.sh greps the PLUGIN_VERSION literal line and the
+// hook is also installed standalone (~/.acp/govern.mjs) with no plugin.json
+// beside it. Agreement with plugin.json / marketplace.json is enforced by
+// scripts/validate-manifest.mjs and test/plugin-version.test.mjs
+// (gatewaystack-connect#1538 item 6).
+const PLUGIN_VERSION = "0.29.1";
 
 // Console base for user-facing deep links (session receipt, #606; enrolment
 // hint). Validated like the gateway bases: a poisoned value would otherwise

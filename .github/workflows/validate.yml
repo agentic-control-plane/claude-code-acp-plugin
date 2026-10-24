@@ -38,6 +38,18 @@ jobs:
           grep -q "agentic-control-plane" "$RUNNER_TEMP/plugins.txt"
           grep -q "enabled" "$RUNNER_TEMP/plugins.txt"
 
+  version-bump:
+    # A changed hook under a version the gateway has already pinned is
+    # reported as tampered on every install (one hash per version).
+    name: hook change needs a version bump
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - run: node scripts/check-version-bump.mjs "origin/${{ github.base_ref }}"
+
   tests:
     name: unit tests
     runs-on: ubuntu-latest

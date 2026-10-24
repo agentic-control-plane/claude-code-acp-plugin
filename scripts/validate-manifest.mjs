@@ -76,6 +76,22 @@ if (marketplace) {
   }
 }
 
+// The hook's PLUGIN_VERSION is a literal (install.sh greps it; standalone
+// installs have no manifest beside the hook), so CI is what keeps it honest.
+if (plugin) {
+  const src = readFileSync(join(ROOT, "bin/govern.mjs"), "utf8");
+  // Exactly what install.sh does: first match in the whole file.
+  const all = src.match(/PLUGIN_VERSION = "[^"]*"/g) ?? [];
+  const first = all[0]?.replace(/.*"(.*)"/, "$1");
+  if (all.length !== 1) {
+    fail(`bin/govern.mjs: expected exactly one \`PLUGIN_VERSION = "..."\` match (install.sh takes the first), found ${all.length}`);
+  } else if (first !== plugin.version) {
+    fail(`version drift: bin/govern.mjs PLUGIN_VERSION ${first} vs plugin.json ${plugin.version}`);
+  } else {
+    ok(`govern.mjs PLUGIN_VERSION in sync (${first})`);
+  }
+}
+
 if (failures) {
   console.error(`\n${failures} manifest problem(s). A real install would fail even if \`claude plugin validate\` passes.`);
   process.exit(1);
