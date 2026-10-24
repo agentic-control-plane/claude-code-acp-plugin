@@ -35,7 +35,7 @@ function freshHome() {
   return home;
 }
 
-function fakeGateway(attestBody, attestHeaders = {}) {
+function fakeGateway(attestBody, attestHeaders = {}, attestStatus = 200) {
   return new Promise((resolve) => {
     const received = [];
     const server = createServer((req, res) => {
@@ -43,7 +43,7 @@ function fakeGateway(attestBody, attestHeaders = {}) {
       req.on("data", (c) => { raw += c; });
       req.on("end", () => {
         received.push({ url: req.url, body: raw });
-        res.writeHead(200, { "content-type": "application/json", ...(req.url === "/govern/attest" ? attestHeaders : {}) });
+        res.writeHead(req.url === "/govern/attest" ? attestStatus : 200, { "content-type": "application/json", ...(req.url === "/govern/attest" ? attestHeaders : {}) });
         res.end(JSON.stringify(req.url === "/govern/attest" ? attestBody : { ok: true, accepted: 1 }));
       });
     });
@@ -186,12 +186,62 @@ test("SessionStart renders the enforce form with the rule count when the gateway
     rmSync(home2, { recursive: true, force: true });
   }
   const home3 = freshHome();
-  const gw3 = await fakeGateway({ ok: true, verdict: "attested", mode: "audit", state_line: "[ACP] audit — recording · 2 rules waiting\u0007 · /acp-enforce" });
+  const gw3 = await fakeGateway({ ok: true, verdict: "attested", mode: "audit", state_line: "[ACP] audit — recording · 2 rules waiting\u0007\n· /acp-enforce\n" });
   try {
     const out = parseOne((await sessionStart(home3, gw3.port)).stdout);
-    assert.equal(out.systemMessage, "[ACP] audit — recording · 2 rules waiting  · /acp-enforce", "gateway line is used verbatim, control characters stripped");
+    assert.equal(out.systemMessage, "[ACP] audit — recording · 2 rules waiting  · /acp-enforce", "gateway line is used verbatim, control characters and line breaks flattened");
   } finally {
     gw3.server.close();
     rmSync(home3, { recursive: true, force: true });
+  }
+});
+
+// A rejected attest describes no workspace: no state line, and the session's
+// marker stays unclaimed so a later successful start can still say it.
+test("SessionStart on a rejected attest (401, 429, ok:false) writes no state line, and the marker is not consumed", async () => {
+  for (const [status, body] of [[401, { ok: false, error: "unauthenticated" }], [429, { ok: false, error: "rate-limited" }], [200, { ok: false, error: "workspace deleted" }]]) {
+    const home = freshHome();
+    const gw = await fakeGateway(body, {}, status);
+    try {
+      const r = await sessionStart(home, gw.port);
+      assert.equal(r.status, 0, r.stderr);
+      assert.equal(r.stdout.trim(), "", `HTTP ${status}: ${r.stdout}`);
+      // The next, accepted start for the same session still gets its line.
+      const ok = await fakeGateway({ ok: true, verdict: "attested" });
+      try {
+        const out = parseOne((await sessionStart(home, ok.port)).stdout);
+        assert.equal(out.systemMessage, STATE_UNKNOWN);
+      } finally { ok.server.close(); }
+    } finally {
+      gw.server.close();
+      rmSync(home, { recursive: true, force: true });
+    }
+  }
+});
+
+// One update command for the human: the gateway's own upgrade line wins over
+// the version-header line — except the below-minimum severity, which stays.
+test("SessionStart shows one update line when the gateway's upgrade_notice fires, but keeps the below-minimum line", async () => {
+  const UPG = "Your ACP plugin is out of date — type /acp-upgrade to update.";
+  const home = freshHome();
+  const gw = await fakeGateway({ ok: true, verdict: "attested", upgrade_notice: UPG }, { "X-ACP-Latest-Version": "99.0.0" });
+  try {
+    const out = parseOne((await sessionStart(home, gw.port)).stdout);
+    assert.match(out.systemMessage, /type \/acp-upgrade/);
+    assert.doesNotMatch(out.systemMessage, /newer ACP hook/);
+    assert.equal(out.hookSpecificOutput, undefined);
+  } finally {
+    gw.server.close();
+    rmSync(home, { recursive: true, force: true });
+  }
+  const home2 = freshHome();
+  const gw2 = await fakeGateway({ ok: true, verdict: "attested", upgrade_notice: UPG }, { "X-ACP-Latest-Version": "99.0.0", "X-ACP-Min-Good-Version": "99.0.0" });
+  try {
+    const out = parseOne((await sessionStart(home2, gw2.port)).stdout);
+    assert.match(out.systemMessage, /type \/acp-upgrade/);
+    assert.match(out.systemMessage, /below the minimum v99\.0\.0 — some protections may not apply\. Update now: /);
+  } finally {
+    gw2.server.close();
+    rmSync(home2, { recursive: true, force: true });
   }
 });

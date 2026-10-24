@@ -406,6 +406,12 @@ const POST_HOOK_PAYLOAD_CEILING = 200 * 1024;
 function stripControl(v) {
   return String(v ?? "").replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f‪-‮⁦-⁩]/g, " ");
 }
+// For fields that are ONE line by contract (state_line, catch_up): line
+// breaks and tabs become spaces too, so a gateway value can never split the
+// human channel into extra lines.
+function oneLine(v) {
+  return stripControl(v).replace(/[\r\n\t]+/g, " ").trim();
+}
 
 // Hostname-only form of ACP_API for env-var injection (e.g. GH_HOST).
 // gh CLI accepts hostnames, not URLs — strip protocol + trailing slash.
@@ -1526,7 +1532,7 @@ async function handlePreToolUse() {
     // and once per session per tool key, so a run of holds on the same
     // tool does not repeat it. A safety-floor ask says truthfully that no
     // rule turns it off.
-    const nextStep = decision === "ask" ? holdNextStep(reason) : null;
+    const nextStep = decision === "ask" ? holdNextStep(reason, verdict) : null;
     process.stdout.write(JSON.stringify({
       hookSpecificOutput: {
         hookEventName: "PreToolUse",
@@ -1537,24 +1543,43 @@ async function handlePreToolUse() {
     }));
     process.exit(0);
   }
-  function holdNextStep(reason) {
+  function holdNextStep(reason, verdict) {
     try {
-      // Same shapes /acp-why reads (explainHeld): the gateway names the rule
-      // as "step_up by <tier label> policy for <ToolKey>", and the floors
-      // open with their own label. The ToolKey is exactly what /acp-allow
-      // accepts (e.g. Bash.git.push). No rule key → no allow hint: never
-      // suggest allowing a whole tool the gateway did not name.
-      const rule = /\b(?:denied|step_up|defer) by [^\n]{1,80}? policy for ([A-Za-z][A-Za-z0-9_.:-]{0,79})/.exec(reason);
-      const floor = /^\s*(?:\[ACP\]\s*|ACP \(Agentic Control Plane\) asks:\s*)?(hardline floor|governance surface|uninstall floor|destructive floor)\b/i.test(reason);
-      // The gateway's prose often ends the key with a sentence stop
-      // ("… for Bash.git. Yes runs it once"); never hand that to /acp-allow.
-      const key = !floor && rule ? rule[1].replace(/[.:]+$/, "") || null : null;
-      const line = floor
-        ? "Approve once here. This is the safety floor, so no rule stops the asking. /acp-why explains."
-        : key
-          ? `Approve once here, or /acp-allow ${key} to stop being asked for this tool. /acp-why explains.`
-          : "Approve once here. /acp-why explains.";
-      const cls = key ? `hold-${key.replace(/[^A-Za-z0-9._-]/g, "_")}` : (floor ? "hold-floor" : "hold-other");
+      // Today's gateway (govern/harnessAsk.ts harnessAskReason) sends:
+      //   ACP (Agentic Control Plane) asks: <action>
+      //     agent says: "<description>"                     (optional)
+      //     <command> · rule <ToolKey> · yes = run once · /acp-allow <ToolKey>
+      // and drops the /acp-allow hint when that line would run long. Floors
+      // explain themselves in the action: "(destructive floor: …)" /
+      // "(uninstall floor: …)", or arrive typed as rule_label. The older
+      // "step_up by <tier> policy for <ToolKey>" prose is the fallback.
+      // Say only what the gateway has NOT already said: never repeat a
+      // hint the dialog carries. The ToolKey is exactly what /acp-allow
+      // accepts (e.g. Bash.git.push); no key → no allow hint, never a guess.
+      const label = typeof verdict?.rule_label === "string" ? verdict.rule_label : "";
+      const floor = /\((?:destructive|uninstall|hardline) floor:/i.test(reason)
+        || /\b(?:destructive|uninstall|hardline) floor\b/i.test(label)
+        || /^\s*(?:\[ACP\]\s*)?(hardline floor|governance surface|uninstall floor|destructive floor)\b/i.test(reason);
+      const saysOnce = /\byes = run once\b/.test(reason);
+      const saysAllow = /\/acp-allow\b/.test(reason);
+      const m = /(?:^\s*|· )rule ([A-Za-z][A-Za-z0-9_.:-]{0,79}) · yes = run once/m.exec(reason)
+        || /\b(?:denied|step_up|defer) by [^\n]{1,80}? policy for ([A-Za-z][A-Za-z0-9_.:-]{0,79})/.exec(reason);
+      // Legacy prose ends the key with a sentence stop ("… for Bash.git.");
+      // never hand that to /acp-allow.
+      const key = !floor && m ? m[1].replace(/[.:]+$/, "") || null : null;
+      const once = saysOnce ? "" : "Approve once here";
+      let line;
+      let cls;
+      if (floor) {
+        line = `${once ? `${once}. ` : ""}This is the safety floor, so no rule stops the asking. /acp-why explains.`;
+        cls = "hold-floor";
+      } else if (saysAllow || !key) {
+        line = `${once ? `${once}. ` : ""}/acp-why explains.`;
+        cls = key ? `hold-${key.replace(/[^A-Za-z0-9._-]/g, "_")}` : "hold-other";
+      } else {
+        line = `${once ? `${once}, or ` : ""}/acp-allow ${key} to stop being asked for this tool. /acp-why explains.`;
+        cls = `hold-${key.replace(/[^A-Za-z0-9._-]/g, "_")}`;
+      }
       return onceThisSession(cls) ? line : null;
     } catch { return null; }
   }
@@ -2176,7 +2201,7 @@ function sessionStateLine(data) {
     if (!data || typeof data !== "object") return null;
     if (!onceThisSession("state")) return null;
     if (typeof data.state_line === "string" && data.state_line.trim()) {
-      return stripControl(data.state_line).trim().slice(0, 300);
+      return oneLine(data.state_line).slice(0, 300);
     }
     const mode = data.mode === "audit" || data.mode === "enforce" ? data.mode : null;
     if (mode === "enforce") {
@@ -2281,16 +2306,24 @@ async function handleSessionStart() {
       ? data.notice.trim()
       : null;
     context = upgradeNotice || null;
-    stateLine = sessionStateLine(data);
+    // The state line describes a workspace this key is attested into. A
+    // rejected attest (401 unauthenticated, 429, a tombstoned workspace's
+    // ok:false) describes nothing — say nothing, and leave the session's
+    // marker unclaimed so a later successful start can still say it.
+    stateLine = res.ok && data && data.ok !== false ? sessionStateLine(data) : null;
     // catch_up (#1351): one human line since this user's previous session
     // start. Shown every SessionStart it's present on — the gateway itself
     // bounds how often it has anything to say (cap 7 days, ≥60s cache).
     catchUp = data && typeof data.catch_up === "string" && data.catch_up.trim()
-      ? stripControl(data.catch_up).trim()
+      ? oneLine(data.catch_up)
       : null;
     upgradeOnce = newUpgrade && shouldNoticeNow({ markerPath: UPGRADE_NOTICE_MARKER, ttlMs: UPGRADE_NOTICE_TTL_MS })
       ? newUpgrade
       : null;
+    // One update command for the human, not two: when the gateway's own
+    // upgrade line fires, the version-header line is redundant — unless it
+    // carries the below-minimum severity, which the human must still see.
+    if (upgradeOnce && staleOnce && !/below the minimum/.test(staleOnce)) staleOnce = null;
   } catch {
     // silent — absence of attestation is visible server-side by design
   } finally {
