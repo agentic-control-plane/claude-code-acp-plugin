@@ -1,6 +1,6 @@
 ---
 name: acp-audit
-description: Put this workspace back in audit mode — everything recorded, nothing held. You confirm with one tap.
+description: "Put this workspace back in audit mode — every call recorded, your rules don't block yet (the safety floor still applies). You confirm with one tap."
 user-invocable: true
 ---
 
