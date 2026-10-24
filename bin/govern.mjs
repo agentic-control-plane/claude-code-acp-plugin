@@ -1542,7 +1542,7 @@ async function handlePreToolUse() {
       // Same shapes /acp-why reads (explainHeld): the gateway names the rule
       // as "step_up by <tier label> policy for <ToolKey>", and the floors
       // open with their own label. The ToolKey is exactly what /acp-allow
-      // accepts (e.g. Bash.git-push). No rule key → no allow hint: never
+      // accepts (e.g. Bash.git.push). No rule key → no allow hint: never
       // suggest allowing a whole tool the gateway did not name.
       const rule = /\b(?:denied|step_up|defer) by [^\n]{1,80}? policy for ([A-Za-z][A-Za-z0-9_.:-]{0,79})/.exec(reason);
       const floor = /^\s*(?:\[ACP\]\s*|ACP \(Agentic Control Plane\) asks:\s*)?(hardline floor|governance surface|uninstall floor|destructive floor)\b/i.test(reason);

@@ -72,7 +72,7 @@ When ACP denies a call, the plugin tells you why with a distinct prefix so you c
 - `[ACP] Gateway error — tool blocked for safety (HTTP X)` — ACP responded with an error (e.g. auth, server crash)
 - `[ACP] Gateway unreachable — tool blocked for safety` — ACP didn't respond at all (timeout, network)
 
-When a call is held for your approval, the dialog shows the reason and the line under it names the next step: approve once here, or `/acp-allow <ToolKey>` (the key the reason names, e.g. `Bash.git-push`) to stop being asked for that tool; `/acp-why` explains. The hint is shown once per session per tool key; a safety-floor ask says truthfully that no rule stops it.
+When a call is held for your approval, the dialog shows the reason and the line under it names the next step: approve once here, or `/acp-allow <ToolKey>` (the key the reason names, e.g. `Bash.git.push`) to stop being asked for that tool; `/acp-why` explains. The hint is shown once per session per tool key; a safety-floor ask says truthfully that no rule stops it.
 
 When the hook is behind, the human sees one line with one command: `[ACP] A newer ACP hook is available (vX; this is vY). Update: acp-update`, or, below the minimum version the gateway supports, `[ACP] This hook is vY, below the minimum vZ — some protections may not apply. Update now: acp-update`. `acp-update` is written by the installer; a marketplace-only install is given the installer command instead. At most once per 24h.
 
