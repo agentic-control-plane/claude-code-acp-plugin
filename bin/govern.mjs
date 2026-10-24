@@ -127,7 +127,7 @@ const ACP_GOVERN = ACP_DEV_BASE ?? resolveAcpBase(
 // beside it. Agreement with plugin.json / marketplace.json is enforced by
 // scripts/validate-manifest.mjs and test/plugin-version.test.mjs
 // (gatewaystack-connect#1538 item 6).
-const PLUGIN_VERSION = "0.29.1";
+const PLUGIN_VERSION = "0.29.2";
 
 // Console base for user-facing deep links (session receipt, #606; enrolment
 // hint). Validated like the gateway bases: a poisoned value would otherwise
@@ -2655,10 +2655,16 @@ async function handleUserPromptExpansion() {
             return `  • ${clean(a?.line)}${cmd}`;
           }).join("\n")
         : "";
+      // The enforce hint is only useful where the command can run: audit mode
+      // AND terminal_intents rolled out for this tenant. The gateway reports
+      // the latter as `terminalIntents: true` (absent on older gateways, so
+      // the hint stays off rather than pointing at a command that 404s).
       const next = s.mode === "enforce"
         ? "/acp-allow <tool> stops the asking for one tool; /acp-judge <tool> lets the judge decide it; /acp-audit records only."
-        : "/acp-enforce turns the starter rules on so they ask first.";
-      blockExpansion(`[ACP] ${s.workspace} is in ${s.mode} mode.\nInteractive rules:\n${rules}${proposals}${asks}${advice}\n${next}`);
+        : s.mode === "audit" && s.terminalIntents === true
+          ? "/acp-enforce turns the starter rules on so they ask first."
+          : "";
+      blockExpansion(`[ACP] ${s.workspace} is in ${s.mode} mode.\nInteractive rules:\n${rules}${proposals}${asks}${advice}${next ? `\n${next}` : ""}`);
     }
 
     const res = await fetch(`${ACP_API}/plugin/intents`, {
