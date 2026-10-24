@@ -113,9 +113,11 @@ test("upgrade_notice is shown to the human once per 24h, and suppresses the old 
   // is present (CONTRACT §4).
   assert.equal(out1.hookSpecificOutput, undefined, "old notice must not be forwarded as additionalContext");
 
-  // A second SessionStart within the 24h window must not repeat it.
+  // A second SessionStart within the 24h window must not repeat it. (A new
+  // session still gets its own one-per-session state line, gsc#1699.)
   const out2 = await runHook(sessionStart("sess-upgrade-2"));
-  assert.equal(out2, null, "upgrade_notice must not repeat inside the 24h window");
+  assert.doesNotMatch(out2?.systemMessage ?? "", /acp-upgrade/, "upgrade_notice must not repeat inside the 24h window");
+  assert.equal(out2?.hookSpecificOutput, undefined);
 });
 
 test("catch_up is shown as a human systemMessage at SessionStart", async () => {

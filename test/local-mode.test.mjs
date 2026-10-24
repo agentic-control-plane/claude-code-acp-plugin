@@ -74,6 +74,18 @@ test("floor: force-push to main asks (#1335: destructive floor, not hardline)", 
   assert.match(out.hookSpecificOutput.permissionDecisionReason, /force-push/);
 });
 
+// gsc#1699 ws2 item 3: in local mode the bundled engine runs both floor
+// tiers itself, so the full contract form is true and said once per session.
+test("SessionStart: one state line per session naming both floor tiers; a re-fired SessionStart is silent", () => {
+  const start = { hook_event_name: "SessionStart", session_id: "local-state-1", cwd: "/work" };
+  const out = hook(start);
+  assert.deepEqual(out, {
+    systemMessage: "ACP: local — your rules in ~/.acp/policy.json apply · always blocked: rm -rf ~, disk wipes · asks first: force-push, DROP, curl|sh",
+  });
+  assert.equal(hook(start), null, "same session: silent");
+  assert.ok(!auditLines().some((l) => l.event === "pre" && l.tool === undefined), "no audit row for a session start");
+});
+
 test("policy: curl maps to ask under the seeded policy", () => {
   const out = hook(pre("curl -s https://api.stripe.com/v1/charges"));
   assert.equal(out.hookSpecificOutput.permissionDecision, "ask");

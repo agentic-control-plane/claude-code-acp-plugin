@@ -10,6 +10,27 @@ Use this when ACP reports that a newer plugin version is available (an
 `[ACP]` upgrade notice at session start), or when the user asks to upgrade
 ACP.
 
+## Two severities
+
+- "A newer ACP hook is available" — informational; update when convenient.
+- "This hook is vX, below the minimum vY — some protections may not apply"
+  — the gateway no longer fully supports this version; update now.
+
+## The shortest path: the human runs it
+
+If the user is at the terminal, the fastest route is for them to run one
+command themselves, in their own shell:
+
+```bash
+acp-update
+```
+
+`acp-update` is written by the installer (`~/.acp/bin/acp-update`) and runs
+the canonical installer below. If it is not on their machine (a
+marketplace-only install), they run the installer directly, exactly as
+written. Tell them this first; the approval-gated path below is for when
+they ask YOU to do it.
+
 ## Why upgrades matter
 
 The govern hook is the enforcement point on this machine. Old versions can
@@ -18,7 +39,7 @@ gateway latency, and a timed-out PreToolUse hook is non-blocking: the call
 runs even though the server issued a deny. Upgrading closes gaps that are
 already fixed upstream.
 
-## How to upgrade
+## How to upgrade when the agent runs it
 
 1. Run the canonical installer, exactly:
 
@@ -26,6 +47,7 @@ already fixed upstream.
    curl -sf https://agenticcontrolplane.com/install.sh | bash
    ```
 
+   This is the same command `acp-update` runs, same shell (`| bash`).
    Expect an approval requirement: refreshing the governance hook is
    step_up-gated at unattended tiers, and the deny reason carries the
    approval link. Ask your human to approve it in the ACP console, then

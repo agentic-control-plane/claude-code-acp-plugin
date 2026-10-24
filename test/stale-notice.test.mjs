@@ -14,6 +14,8 @@ import {
   readVersionHeaders,
   staleNoticeText,
   shouldNoticeNow,
+  updateCommand,
+  INSTALL_CMD,
 } from "../lib/staleNotice.mjs";
 
 const realFs = { readFileSync, writeFileSync, mkdirSync };
@@ -54,21 +56,39 @@ test("readVersionHeaders is nulls when headers are absent, empty, or unreadable"
   assert.deepEqual(readVersionHeaders({ headers: { get() { throw new Error("boom"); } } }), { latest: null, minGood: null });
 });
 
-test("staleNoticeText: outdated", () => {
+// gsc#1699 ws2 item 4: worded for the human, one command they run
+// themselves, and two severities that read differently.
+test("staleNoticeText: a newer version is available (informational)", () => {
   assert.equal(
     staleNoticeText({ current: "0.4.0", latest: "0.16.0", minGood: "0.1.0", updateCmd: "acp-update" }),
-    "[ACP] governance hook v0.4.0 is outdated (v0.16.0 current). Run: acp-update",
+    "[ACP] A newer ACP hook is available (v0.16.0; this is v0.4.0). Update: acp-update",
   );
 });
 
-test("staleNoticeText: below minimum supported wins over outdated", () => {
+test("staleNoticeText: below minimum wins over merely behind, and says protections may not apply", () => {
   assert.equal(
     staleNoticeText({ current: "0.4.0", latest: "0.16.0", minGood: "0.12.0", updateCmd: "acp-update" }),
-    "[ACP] governance hook v0.4.0 is below the minimum supported v0.12.0 — denies may not be enforced. Run: acp-update",
+    "[ACP] This hook is v0.4.0, below the minimum v0.12.0 — some protections may not apply. Update now: acp-update",
   );
   assert.equal(
     staleNoticeText({ current: "0.4.0", latest: null, minGood: "0.12.0" }),
-    "[ACP] governance hook v0.4.0 is below the minimum supported v0.12.0 — denies may not be enforced. Run: acp-update",
+    "[ACP] This hook is v0.4.0, below the minimum v0.12.0 — some protections may not apply. Update now: acp-update",
+  );
+  for (const text of [
+    staleNoticeText({ current: "0.4.0", latest: "0.16.0", minGood: "0.12.0" }),
+    staleNoticeText({ current: "0.4.0", latest: "0.16.0", minGood: "0.1.0" }),
+  ]) {
+    assert.ok(!/governance|denies may not be enforced/i.test(text), `plain words only: ${text}`);
+  }
+});
+
+test("updateCommand: acp-update when the installer wrote it, else the canonical installer with `| bash`", () => {
+  assert.equal(updateCommand(true), "acp-update");
+  assert.equal(updateCommand(false), INSTALL_CMD);
+  assert.equal(INSTALL_CMD, "curl -sf https://agenticcontrolplane.com/install.sh | bash");
+  assert.match(
+    staleNoticeText({ current: "0.4.0", latest: "0.16.0", minGood: null, updateCmd: updateCommand(false) }),
+    /Update: curl -sf https:\/\/agenticcontrolplane\.com\/install\.sh \| bash$/,
   );
 });
 

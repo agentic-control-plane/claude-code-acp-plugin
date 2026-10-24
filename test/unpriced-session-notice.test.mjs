@@ -47,14 +47,14 @@ const DECIDE = join(ROOT, "bin", "decide.mjs");
 const LOOPBACK = [127, 0, 0, 1].join(".");
 
 // Since 0.18.0 a session with a readable transcript is priced from it
-// (transcript-model-usage.test.mjs), so the notice leads with what the
-// session HAS and names only the policy half as missing.
-const NOTICE_HEAD = "[ACP] Tool calls in this session are checked and logged, and model-call cost is estimated from the session transcript (API-rate equivalent, not a metered charge). Model calls are not policy-checked: plain `claude` sends them straight to the provider, so tool-result redaction and model routing are off.";
-const WITH_LAUNCHER = `${NOTICE_HEAD} For those, launch with \`claude-acp\` (~/.acp/bin/claude-acp). Shown once per session.`;
-const WITHOUT_LAUNCHER = `${NOTICE_HEAD} For those, install the \`claude-acp\` launcher: curl -sf https://agenticcontrolplane.com/install.sh | bash. Shown once per session.`;
+// (transcript-model-usage.test.mjs), so the notice says what the session
+// HAS (an estimate) and the one thing the launcher adds that a human cares
+// about: exact model cost. Plain English, one line (gsc#1699 ws2 item 5).
+const WITH_LAUNCHER = "[ACP] Tool calls are checked. Cost here is estimated — launch with `claude-acp` for exact model cost.";
+const WITHOUT_LAUNCHER = "[ACP] Tool calls are checked. Cost here is estimated — install the `claude-acp` launcher (curl -sf https://agenticcontrolplane.com/install.sh | bash) and launch with it for exact model cost.";
 // A payload with no transcript (a harness that does not hand one over)
 // prices nothing, and the notice must not claim otherwise.
-const UNCOSTED = "[ACP] Tool calls in this session are checked and logged. Model calls are not: plain `claude` sends them straight to the provider, so they are neither priced nor policy-checked (tool-result redaction, model routing). For the cost X-ray and model-call policy, launch with `claude-acp` (~/.acp/bin/claude-acp). Shown once per session.";
+const UNCOSTED = "[ACP] Tool calls are checked. Model cost is not recorded for plain `claude` — launch with `claude-acp` to record it.";
 const WARNING = "[ACP billing] grace period: 3 days left";
 
 let HOME;
@@ -142,7 +142,7 @@ test("plain claude: the first allowed call carries the notice, naming claude-acp
   assert.ok(out, "expected output on stdout");
   assert.equal(out.systemMessage, WITH_LAUNCHER);
   assert.equal(out.hookSpecificOutput, undefined);
-  assert.ok(!/governance/i.test(out.systemMessage), "never says governance");
+  assert.ok(!/governance|policy-checked|redaction|routing/i.test(out.systemMessage), "plain words, no internals");
   assert.ok(existsSync(marker("sess-plain-1")));
 });
 
@@ -190,7 +190,8 @@ test("an ask is unchanged and carries no notice", async () => {
   nextResponse = { decision: "ask", reason: "outward-facing" };
   const asked = await preHook("sess-ask-1");
   assert.equal(asked.hookSpecificOutput?.permissionDecision, "ask");
-  assert.equal(asked.systemMessage, "[ACP] Approval required: outward-facing");
+  assert.match(asked.systemMessage, /^\[ACP\] Approval required: outward-facing(\n|$)/);
+  assert.ok(!asked.systemMessage.includes("claude-acp"));
   assert.ok(!existsSync(marker("sess-ask-1")));
 });
 
@@ -213,7 +214,7 @@ test("no transcript on the payload: nothing is priced, and the notice says so (n
 
 test("codex names codex-acp (both client spellings); cursor has no launcher and gets nothing", async () => {
   const codex = await preHook("sess-codex-1", { env: { ACP_CLIENT: "codex", ACP_HARNESS: "codex" }, transcript: null });
-  assert.match(codex?.systemMessage ?? "", /plain `codex` .*neither priced nor policy-checked.* install the `codex-acp` launcher/);
+  assert.match(codex?.systemMessage ?? "", /Model cost is not recorded for plain `codex` — install the `codex-acp` launcher \(curl -sf https:\/\/agenticcontrolplane\.com\/install\.sh \| bash\) and launch with it to record it\.$/);
   const plugin = await preHook("sess-codex-2", { env: { ACP_CLIENT: "codex-plugin", ACP_HARNESS: "codex" } });
   assert.match(plugin?.systemMessage ?? "", /`codex-acp`/);
   assert.equal(await preHook("sess-cursor-1", { env: { ACP_CLIENT: "cursor" } }), null);
