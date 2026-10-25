@@ -2244,7 +2244,7 @@ function readHeld(sessionId) {
 /** The lines /acp-why prints: what was held, why, and what changes it. */
 function explainHeld(held) {
   if (!held || !held.reason) {
-    return "[ACP] Nothing has been held in this session. /acp-approve lists calls waiting from your other sessions.";
+    return "[ACP] Nothing has been held in this session. /acp-status lists calls waiting from your other sessions.";
   }
   const clean = (v) => String(v ?? "").replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g, " ");
   const lines = [`[ACP] Last held call${held.tool ? ` (${clean(held.tool)})` : ""} at ${clean(held.at)}:`, `  ${clean(held.reason)}`];
@@ -2262,7 +2262,7 @@ function explainHeld(held) {
   // The cap is not a rule on this tool: too many earlier asks are still
   // unanswered, so the gateway stopped asking. Answering them is the way out.
   if (/^\s*approval-fatigue-cap:/.test(held.reason)) {
-    lines.push("ACP stopped asking because earlier approvals are still unanswered. /acp-approve lists them to approve or deny; answering them, or waiting out the window, lifts it. /acp-status lists every rule.");
+    lines.push("ACP stopped asking because earlier approvals are still unanswered. /acp-status lists them with links to approve or deny; answering them, or waiting out the window, lifts it.");
     return lines.join("\n");
   }
   if (rule) {
@@ -2604,7 +2604,7 @@ function handleSessionEnd() {
 // writes to the transcript. That is fine by design: the link executes only
 // the intent the human already typed, as that human, once, inside its TTL
 // — nothing a reader of the transcript can redirect.
-const INTENT_COMMAND_RE = /(?:^|:)acp-(enforce|audit|allow|ask|deny|judge|apply|status|why|approve)$/;
+const INTENT_COMMAND_RE = /(?:^|:)acp-(enforce|audit|allow|ask|deny|judge|apply|status|why|approve|notify)$/;
 
 function blockExpansion(reason) {
   process.stdout.write(JSON.stringify({ decision: "block", reason }));

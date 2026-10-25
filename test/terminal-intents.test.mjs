@@ -391,7 +391,7 @@ test("(i) /acp-why with an approval hold prints the approval link", async () => 
 test("(j) /acp-why with nothing held says so and points at other sessions' holds", async () => {
   const out = await runHook(expansion({ command_name: "agentic-control-plane:acp-why", session_id: "sess-never-held" }));
   assert.match(out.reason, /Nothing has been held in this session/);
-  assert.match(out.reason, /\/acp-approve lists calls waiting from your other sessions/);
+  assert.match(out.reason, /\/acp-status lists calls waiting from your other sessions/);
 });
 
 test("(j2) /acp-why on a fatigue-cap deny names the way out, not a rule", async () => {
@@ -403,7 +403,7 @@ test("(j2) /acp-why on a fatigue-cap deny names the way out, not a rule", async 
   await runHook(preToolUse({ session_id: "sess-why-fatigue" }));
   const out = await runHook(expansion({ command_name: "agentic-control-plane:acp-why", session_id: "sess-why-fatigue" }));
   assert.match(out.reason, /ACP stopped asking because earlier approvals are still unanswered/);
-  assert.match(out.reason, /\/acp-approve lists them to approve or deny/);
+  assert.match(out.reason, /\/acp-status lists them with links to approve or deny/);
   assert.ok(!/\/acp-allow/.test(out.reason.split("\n").slice(2).join("\n")), "no rule advice for a cap");
 });
 
@@ -449,4 +449,13 @@ test("(c5) /acp-status in enforce mode never offers /acp-enforce, even with term
   assert.match(out.reason, /^\[ACP\] acme is in enforce mode\./);
   assert.ok(!out.reason.includes(ENFORCE_HINT));
   assert.ok(out.reason.includes("/acp-allow <tool>"));
+});
+
+test("(n1) /acp-notify off files an intent with its target, like the rule commands", async () => {
+  seen = [];
+  const out = await runHook(expansion({ command_name: "agentic-control-plane:acp-notify", command_args: "off" }));
+  assert.equal(out.decision, "block");
+  const post = seen.find((r) => r.url.endsWith("/plugin/intents") && r.method === "POST");
+  assert.ok(post, "posts to /plugin/intents");
+  assert.deepEqual({ kind: post.body.kind, target: post.body.target }, { kind: "notify", target: "off" });
 });
