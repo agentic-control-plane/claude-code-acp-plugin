@@ -127,7 +127,7 @@ const ACP_GOVERN = ACP_DEV_BASE ?? resolveAcpBase(
 // beside it. Agreement with plugin.json / marketplace.json is enforced by
 // scripts/validate-manifest.mjs and test/plugin-version.test.mjs
 // (gatewaystack-connect#1538 item 6).
-const PLUGIN_VERSION = "0.29.3";
+const PLUGIN_VERSION = "0.29.4";
 
 // Console base for user-facing deep links (session receipt, #606; enrolment
 // hint). Validated like the gateway bases: a poisoned value would otherwise
@@ -2417,7 +2417,7 @@ function readHeld(sessionId) {
 /** The lines /acp-why prints: what was held, why, and what changes it. */
 function explainHeld(held) {
   if (!held || !held.reason) {
-    return "[ACP] Nothing has been held in this session.";
+    return "[ACP] Nothing has been held in this session. /acp-status lists calls waiting from your other sessions.";
   }
   const clean = (v) => String(v ?? "").replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g, " ");
   const lines = [`[ACP] Last held call${held.tool ? ` (${clean(held.tool)})` : ""} at ${clean(held.at)}:`, `  ${clean(held.reason)}`];
@@ -2431,6 +2431,12 @@ function explainHeld(held) {
     const j = held.judge;
     const c = typeof j.confidence === "number" ? `, confidence ${j.confidence.toFixed(1)}` : "";
     lines.push(`  Judge said ${j.choice}${c}, ${j.mode === "applied" ? "applied" : "shadow (recorded, not applied)"}.`);
+  }
+  // The cap is not a rule on this tool: too many earlier asks are still
+  // unanswered, so the gateway stopped asking. Answering them is the way out.
+  if (/^\s*approval-fatigue-cap:/.test(held.reason)) {
+    lines.push("ACP stopped asking because earlier approvals are still unanswered. /acp-status lists them with links to approve or deny; answering them, or waiting out the window, lifts it.");
+    return lines.join("\n");
   }
   if (rule) {
     lines.push(`A workspace rule on ${rule[1]} held it. /acp-allow ${rule[1]} stops holding it; /acp-judge ${rule[1]} lets the judge decide it; /acp-status lists every rule.`);
@@ -2771,7 +2777,7 @@ function handleSessionEnd() {
 // writes to the transcript. That is fine by design: the link executes only
 // the intent the human already typed, as that human, once, inside its TTL
 // — nothing a reader of the transcript can redirect.
-const INTENT_COMMAND_RE = /(?:^|:)acp-(enforce|audit|allow|ask|deny|judge|apply|status|why|approve)$/;
+const INTENT_COMMAND_RE = /(?:^|:)acp-(enforce|audit|allow|ask|deny|judge|apply|status|why|approve|notify)$/;
 
 function blockExpansion(reason) {
   process.stdout.write(JSON.stringify({ decision: "block", reason }));
