@@ -127,7 +127,7 @@ const ACP_GOVERN = ACP_DEV_BASE ?? resolveAcpBase(
 // beside it. Agreement with plugin.json / marketplace.json is enforced by
 // scripts/validate-manifest.mjs and test/plugin-version.test.mjs
 // (gatewaystack-connect#1538 item 6).
-const PLUGIN_VERSION = "0.29.3";
+const PLUGIN_VERSION = "0.29.4";
 
 // Console base for user-facing deep links (session receipt, #606; enrolment
 // hint). Validated like the gateway bases: a poisoned value would otherwise
