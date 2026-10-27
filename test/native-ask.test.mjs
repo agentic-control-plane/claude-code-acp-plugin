@@ -191,3 +191,45 @@ test("(e) PostToolUse never sends a capabilities field", async () => {
   assert.ok(req, "expected a request to /govern/tool-output");
   assert.equal(Object.prototype.hasOwnProperty.call(req.body, "capabilities"), false);
 });
+
+// ── gatewaystack-connect#1518: honest capabilities for shared-script clients ──
+
+test("(f) Claude Code sends an explicit attended claim alongside permission_mode", async () => {
+  await runHook(preToolUse({ permission_mode: "default" }));
+  let req = seen.find((s) => s.url === "/govern/tool-use");
+  assert.deepEqual(req.body.attended, { claim: true, source: "permission_mode", mode: "default" });
+  for (const mode of ["dontAsk", "bypassPermissions"]) {
+    seen = [];
+    await runHook(preToolUse({ permission_mode: mode }));
+    req = seen.find((s) => s.url === "/govern/tool-use");
+    assert.deepEqual(req.body.attended, { claim: false, source: "permission_mode", mode });
+  }
+  seen = [];
+  const noMode = preToolUse(); delete noMode.permission_mode;
+  await runHook(noMode);
+  req = seen.find((s) => s.url === "/govern/tool-use");
+  assert.equal(Object.prototype.hasOwnProperty.call(req.body, "attended"), false);
+});
+
+for (const [label, env] of [
+  ["qwen-code via ACP_CLIENT", { ACP_CLIENT: "qwen-code" }],
+  ["cursor via ACP_CLIENT", { ACP_CLIENT: "cursor" }],
+  ["qwen-code via ACP_HARNESS", { ACP_HARNESS: "qwen-code" }],
+  ["cursor via ACP_HARNESS", { ACP_HARNESS: "cursor" }],
+]) {
+  test(`(g) ${label}: no native_ask, no attended`, async () => {
+    await runHook(preToolUse(), env);
+    const req = seen.find((s) => s.url === "/govern/tool-use");
+    assert.ok(req, "expected a request to /govern/tool-use");
+    assert.deepEqual(req.body.capabilities, []);
+    assert.equal(Object.prototype.hasOwnProperty.call(req.body, "attended"), false);
+  });
+
+  test(`(h) ${label}: an ask verdict becomes deny with the gateway reason`, async () => {
+    nextResponse = { decision: "ask", reason: "step_up for Bash.git needs review", approval_id: "ap9", approval_status: "pending" };
+    const out = await runHook(preToolUse(), env);
+    assert.ok(out, "expected output on stdout");
+    assert.equal(out.hookSpecificOutput?.permissionDecision, "deny");
+    assert.match(out.hookSpecificOutput?.permissionDecisionReason ?? "", /step_up for Bash\.git needs review/);
+  });
+}

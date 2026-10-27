@@ -264,6 +264,22 @@ const SHADOW_OFF = /^(off|0|false)$/i.test(process.env.ACP_SHADOW ?? "");
 // hooks.json sets ACP_HARNESS=codex.
 const HARNESS = process.env.ACP_HARNESS || "claude-code";
 
+// Qwen Code and Cursor run THIS script (acp-install sets ACP_CLIENT=qwen-code
+// / cursor, not ACP_HARNESS, so HARNESS above stays "claude-code"). Neither
+// renders an ACP "ask": Qwen Code silently denies it (QwenLM/qwen-code#6321)
+// and Cursor does not enforce it. They must not declare native_ask, and an
+// "ask" verdict becomes a deny carrying the gateway's reason — never an allow.
+// Either env var may identify them; ACP_HARNESS wins nothing over ACP_CLIENT,
+// any match counts (gatewaystack-connect#1518).
+const NO_ASK_CLIENT = /^(qwen-code|cursor)$/i.test(process.env.ACP_CLIENT ?? "")
+  || /^(qwen-code|cursor)$/i.test(process.env.ACP_HARNESS ?? "");
+// True when this harness cannot render an "ask": ask maps to deny.
+const CANT_ASK = HARNESS === "codex" || NO_ASK_CLIENT;
+// True only for genuine Claude Code (not Codex/Copilot/Qwen/Cursor).
+const IS_CLAUDE_CODE = HARNESS === "claude-code" && !NO_ASK_CLIENT;
+const CANT_ASK_NAME = HARNESS === "codex" ? "Codex"
+  : /cursor/i.test(`${process.env.ACP_CLIENT ?? ""} ${process.env.ACP_HARNESS ?? ""}`) ? "Cursor" : "Qwen Code";
+
 // ── GitHub Copilot: one registration, two dialects ─────────────────────
 // Copilot CLI reads ~/.copilot/hooks/*.json. PascalCase event names in that
 // file select its "VS Code compatible" payload: snake_case fields and a
@@ -748,8 +764,8 @@ function applyOfflineFloors(input, mode) {
     const why = mode === "no-key"
       ? "ACP has no key on this machine, so nobody can approve it remotely"
       : "the gateway could not be reached, so nobody can approve it remotely";
-    if (HARNESS === "codex") {
-      const reason = `[ACP] Uninstall floor (${exit}) — ${why}. Codex cannot ask mid-run, so the call is blocked; a human runs it, or run \`acp-uninstall\` yourself in a terminal.`;
+    if (CANT_ASK) {
+      const reason = `[ACP] Uninstall floor (${exit}) — ${why}. ${CANT_ASK_NAME} cannot ask mid-run, so the call is blocked; a human runs it, or run \`acp-uninstall\` yourself in a terminal.`;
       process.stdout.write(JSON.stringify({
         hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: reason },
         systemMessage: reason,
@@ -771,8 +787,8 @@ function applyOfflineFloors(input, mode) {
     const why = mode === "no-key"
       ? "ACP has no key on this machine, so nobody can approve it remotely"
       : "the gateway could not be reached, so nobody can approve it remotely";
-    if (HARNESS === "codex") {
-      const reason = `[ACP] Destructive floor (${soft}) — ${why}. Codex cannot ask mid-run, so the call is blocked; a human runs it, or connects a key.`;
+    if (CANT_ASK) {
+      const reason = `[ACP] Destructive floor (${soft}) — ${why}. ${CANT_ASK_NAME} cannot ask mid-run, so the call is blocked; a human runs it, or connects a key.`;
       process.stdout.write(JSON.stringify({
         hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: reason },
         systemMessage: reason,
@@ -951,10 +967,10 @@ async function runLocal(input) {
     // Same harness quirk as the cloud path: Codex's parser only acts on
     // "deny", so ask → deny with the fix in the message (edit the local
     // policy, re-run). No dashboard link — there is no dashboard in local.
-    if (HARNESS === "codex") {
+    if (CANT_ASK) {
       process.stdout.write(JSON.stringify({
         hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: `[ACP] ${d.reason}` },
-        systemMessage: `[ACP·local] Requires review (${d.reason}) — Codex can't ask mid-run, so the call is blocked. To allow it, set the rule in ~/.acp/policy.json and re-run.`,
+        systemMessage: `[ACP·local] Requires review (${d.reason}) — ${CANT_ASK_NAME} can't ask mid-run, so the call is blocked. To allow it, set the rule in ~/.acp/policy.json and re-run.`,
       }));
     } else {
       process.stdout.write(JSON.stringify({
@@ -1248,7 +1264,13 @@ async function handlePreToolUse() {
     // The gateway keys native ask off this declaration plus the
     // server-resolved tier, permission_mode, and the harness_ask rollout
     // (govern/harnessAsk.ts, server-side). Never sent on PostToolUse.
-    capabilities: HARNESS === "codex" ? [] : ["native_ask"],
+    // Qwen Code / Cursor (CANT_ASK) declare nothing for the same reason.
+    capabilities: CANT_ASK ? [] : ["native_ask"],
+    // Explicit attended claim (gateway parseAttended, harnessAsk.ts). Claude
+    // Code only; omitted when the payload carries no permission_mode.
+    ...(IS_CLAUDE_CODE && typeof input.permission_mode === "string" && input.permission_mode
+      ? { attended: { claim: !/^(dontAsk|bypassPermissions)$/.test(input.permission_mode), source: "permission_mode", mode: input.permission_mode } }
+      : {}),
     ...(toolContext ? { tool_context: toolContext } : {}),
   });
 
@@ -1440,11 +1462,11 @@ async function handlePreToolUse() {
     // Codex has no ask semantic on the wire (see HARNESS note): emit deny
     // with the approval deep link so the human approves out-of-band and
     // the re-run passes under the grant.
-    const decision = HARNESS === "codex" ? "deny" : "ask";
+    const decision = CANT_ASK ? "deny" : "ask";
     // Codex sees this as a hard deny, so it needs the out-of-band route
     // spelled out; Claude Code renders a prompt and the human answers it.
     const steer = decision === "deny"
-      ? "Codex cannot ask mid-run, so this arrives as a block. A human approves it on the dashboard and the re-run passes under the grant — continue with the rest of your task meanwhile."
+      ? `${CANT_ASK_NAME} cannot ask mid-run, so this arrives as a block. A human approves it on the dashboard and the re-run passes under the grant — continue with the rest of your task meanwhile.`
       : "A human is being asked now in this terminal. This holds ONE operation, not your task; if they say no, do not retry the same command — do something else or ask them.";
     // Newer gateways brand the reason themselves ("ACP (Agentic Control
     // Plane) asks: …", gsc#1372); prepend only for older ones so the dialog
