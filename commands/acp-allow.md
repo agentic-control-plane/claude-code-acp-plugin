@@ -1,6 +1,6 @@
 ---
 name: acp-allow
-description: "Stop asking for one tool in interactive sessions: /acp-allow Bash.git-push. You confirm with one tap."
+description: "Stop asking for one tool in interactive sessions: /acp-allow Bash.git.push. You confirm with one tap."
 user-invocable: true
 ---
 

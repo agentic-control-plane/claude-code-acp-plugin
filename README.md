@@ -42,13 +42,17 @@ Plain `claude` sends model calls straight to Anthropic, so the hook never sees t
 
 ### Plain-launch notice (v0.19.0+)
 
-This hook sees every tool call whether you start `claude` or `claude-acp`, and since 0.18.0 it prices model calls from the transcript either way. What it cannot do under plain `claude` is policy-check the model calls themselves: only `claude-acp` (`~/.acp/bin/claude-acp`, written by the installer) routes them through the ACP proxy, where tool-result redaction and model routing run and where cost is metered rather than estimated. Under plain `claude`, the first allowed call of each session says so, once:
+This hook sees every tool call whether you start `claude` or `claude-acp`, and since 0.18.0 it prices model calls from the transcript either way (an API-rate estimate, not a metered charge). What it cannot do under plain `claude` is see the model calls themselves: only `claude-acp` (`~/.acp/bin/claude-acp`, written by the installer) routes them through the ACP proxy, where cost is exact and where tool-result redaction and model routing run. Under plain `claude`, the first allowed call of each session says so, once, in one line:
 
 ```
-[ACP] Tool calls in this session are checked and logged, and model-call cost is estimated from the session transcript (API-rate equivalent, not a metered charge). Model calls are not policy-checked: plain `claude` sends them straight to the provider, so tool-result redaction and model routing are off. For those, launch with `claude-acp` (~/.acp/bin/claude-acp). Shown once per session.
+[ACP] Tool calls are checked. Cost here is estimated — launch with `claude-acp` for exact model cost.
 ```
 
-A harness whose hook payload carries no transcript (so nothing is priced) gets the plainer form: "…neither priced nor policy-checked… For the cost X-ray and model-call policy, launch with…". Nothing else changes: the notice rides an allow, never a deny or an ask, and a session started by the launcher (which exports `ACP_KEY`) or with `ANTHROPIC_BASE_URL` already at the ACP proxy never sees it. Local mode never shows it. Once per session is enforced with a marker under `~/.acp/session-notices/` (pruned after 7 days, capped at 200).
+A harness whose hook payload carries no transcript (so nothing is priced) gets: "Model cost is not recorded for plain `claude` — launch with `claude-acp` to record it." A marketplace-only install with no launcher on disk is pointed at the installer (`curl -sf https://agenticcontrolplane.com/install.sh | bash`) instead of a path that does not exist. Nothing else changes: the notice rides an allow, never a deny or an ask, and a session started by the launcher (which exports `ACP_KEY`) or with `ANTHROPIC_BASE_URL` already at the ACP proxy never sees it. Local mode never shows it. Once per session is enforced with a marker under `~/.acp/session-notices/` (pruned after 7 days, capped at 200).
+
+### Session state line (v0.30.0+)
+
+Each session opens with one line saying what ACP is doing for this workspace, in the shared short form — and only what is true for this tenant. With a gateway that sends `mode` on `/govern/attest`: `[ACP] audit — recording · always blocked: rm -rf ~, disk wipes · /acp-enforce to apply your rules` (the `held for your OK: force-push, DROP, curl|sh` clause appears only when the gateway also sends `floor_asks_first: true`, i.e. that tier is live for the workspace), or `[ACP] enforce — N rules apply · plus the safety floor · /acp-status`. A gateway-rendered `state_line` is shown verbatim instead. When the gateway sends none of these, the hook says only what every workspace has in every mode: `[ACP] recording · always blocked: rm -rf ~, disk wipes · /acp-status for your mode and rules`. Local mode runs both floor tiers itself and says so. Once per session: a resume or compaction that re-fires SessionStart does not repeat it.
 
 ### Offline floor and local ledger (v0.16.0+)
 
@@ -64,8 +68,13 @@ When a key is connected (or the gateway comes back), the ledger uploads **once**
 When ACP denies a call, the plugin tells you why with a distinct prefix so you can tell network problems apart from real policy denials at a glance:
 
 - `[ACP] Denied by policy: <reason>` — a workspace policy intentionally blocked the call
+- `[ACP] Busy — too many calls at once; retrying this call is safe.` — a rate limit, not a rule: nothing to allow or fix; the model is told to retry the same call shortly
 - `[ACP] Gateway error — tool blocked for safety (HTTP X)` — ACP responded with an error (e.g. auth, server crash)
 - `[ACP] Gateway unreachable — tool blocked for safety` — ACP didn't respond at all (timeout, network)
+
+When a call is held for your approval, the dialog shows the reason and the line under it names the next step: approve once here, or `/acp-allow <ToolKey>` (the key the reason names, e.g. `Bash.git.push`) to stop being asked for that tool; `/acp-why` explains. The hint is shown once per session per tool key; a safety-floor ask says truthfully that no rule stops it.
+
+When the hook is behind, the human sees one line with one command: `[ACP] A newer ACP hook is available (vX; this is vY). Update: acp-update`, or, below the minimum version the gateway supports, `[ACP] This hook is vY, below the minimum vZ — some protections may not apply. Update now: acp-update`. `acp-update` is written by the installer; a marketplace-only install is given the installer command instead. At most once per 24h.
 
 ### Approval requests (v0.17.0+)
 

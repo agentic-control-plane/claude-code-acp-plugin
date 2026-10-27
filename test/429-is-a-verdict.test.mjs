@@ -48,14 +48,16 @@ function runHook(base, { tier = "unattended" } = {}) {
     child.on("close", () => {
       let decision = "allow";
       let message = "";
+      let reason = "";
       if (out.trim()) {
         try {
           const j = JSON.parse(out);
           decision = j?.hookSpecificOutput?.permissionDecision ?? "allow";
           message = j?.systemMessage ?? "";
+          reason = j?.hookSpecificOutput?.permissionDecisionReason ?? "";
         } catch { decision = "unparseable"; }
       }
-      resolve({ decision, message });
+      resolve({ decision, message, reason });
     });
     child.stdin.end(JSON.stringify({
       session_id: "t", cwd: "/tmp", hook_event_name: "PreToolUse",
@@ -66,23 +68,53 @@ function runHook(base, { tier = "unattended" } = {}) {
   });
 }
 
-test("429 deny body blocks an INTERACTIVE session (was: fail-open, rate limit unenforced)", async () => {
+// gsc#1699 ws2 item 1: a rate limit is capacity, not a rule. The human line
+// says "Busy" and that retrying is safe — never "Denied by policy", which
+// sends people hunting for a rule that does not exist. The model keeps the
+// typed retry steer. Older gateways send no `kind`; the reason text is the
+// fallback.
+const BUSY = "[ACP] Busy — too many calls at once; retrying this call is safe.";
+
+test("429 deny body blocks an INTERACTIVE session (was: fail-open, rate limit unenforced) and reads as Busy, not a policy deny", async () => {
   const { server, base } = await stubGateway(429, { decision: "deny", reason: "rate-limited — wait for the window to reset" });
   try {
     const r = await runHook(base, { tier: "interactive" });
     assert.equal(r.decision, "deny");
-    assert.match(r.message, /rate-limited/);
-    assert.doesNotMatch(r.message, /unreachable|UNGOVERNED/i);
+    assert.equal(r.message, BUSY);
+    assert.doesNotMatch(r.message, /Denied by policy|unreachable|UNGOVERNED/i);
+    // The model still gets the real reason and the retry steer.
+    assert.match(r.reason, /rate-limited — wait for the window to reset/);
+    assert.match(r.reason, /retry this exact call shortly/);
+    assert.doesNotMatch(r.reason, /Denied by policy/);
   } finally { server.close(); }
 });
 
-test("429 deny body blocks an unattended tier with the real reason, not 'unreachable'", async () => {
+test("429 deny body blocks an unattended tier and reads as Busy, not 'unreachable'", async () => {
   const { server, base } = await stubGateway(429, { decision: "deny", reason: "rate-limited — wait for the window to reset" });
   try {
     const r = await runHook(base, { tier: "unattended" });
     assert.equal(r.decision, "deny");
-    assert.match(r.message, /rate-limited/);
+    assert.equal(r.message, BUSY);
     assert.doesNotMatch(r.message, /unreachable/i);
+  } finally { server.close(); }
+});
+
+test("a typed kind:\"retry\" verdict is Busy even when the reason does not say rate-limited", async () => {
+  const { server, base } = await stubGateway(429, { decision: "deny", kind: "retry", reason: "Too many requests. Retry after 2s" });
+  try {
+    const r = await runHook(base, { tier: "interactive" });
+    assert.equal(r.decision, "deny");
+    assert.equal(r.message, BUSY);
+    assert.match(r.reason, /^\[ACP\] Busy: Too many requests\. Retry after 2s\n\nNothing is wrong with this call/);
+  } finally { server.close(); }
+});
+
+test("a typed non-retry deny whose prose mentions a limit is still a policy deny", async () => {
+  const { server, base } = await stubGateway(200, { decision: "deny", kind: "reformulate", reason: "denied by interactive tier policy for Bash.curl (rate limit on outbound hosts)" });
+  try {
+    const r = await runHook(base, { tier: "interactive" });
+    assert.equal(r.decision, "deny");
+    assert.match(r.message, /^\[ACP\] Denied by policy: denied by interactive tier policy/);
   } finally { server.close(); }
 });
 

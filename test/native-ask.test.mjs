@@ -177,12 +177,76 @@ test("(c2) a reason the gateway already branded is not prefixed again (gsc#1372)
   const dialog = out.hookSpecificOutput?.permissionDecisionReason ?? "";
   assert.ok(dialog.startsWith(branded), `dialog should open with the gateway's own brand, got: ${dialog}`);
   assert.doesNotMatch(dialog, /\[ACP\] Approval required:/);
-  assert.equal(out.systemMessage, branded);
+  assert.ok(out.systemMessage.startsWith(branded), `human line should open with the gateway's own brand, got: ${out.systemMessage}`);
 
   // A reason that already carries the plugin's own tag is left alone too.
   nextResponse = { decision: "ask", reason: "[ACP] already tagged", approval_id: "ap3", approval_status: "pending" };
   const tagged = await runHook(preToolUse());
-  assert.equal(tagged.systemMessage, "[ACP] already tagged");
+  assert.ok(tagged.systemMessage.startsWith("[ACP] already tagged"));
+});
+
+// gsc#1699 ws2 item 2 (#1472): the human line on a hold names the next step
+// — approve once here, or the one command that stops the asking for this
+// tool — once per session per tool key, never in the model's dialog text.
+// The reason shape today's gateway sends (govern/harnessAsk.ts
+// harnessAskReason): three lines, plain text, and it already carries
+// "yes = run once" and, when the line fits, "/acp-allow <ToolKey>".
+const REAL_ASK = "ACP (Agentic Control Plane) asks: Push to origin main\n  git push --force origin main · rule Bash.git.push · yes = run once · /acp-allow Bash.git.push";
+const REAL_ASK_NO_HINT = "ACP (Agentic Control Plane) asks: Fetch https://example.com\n  curl -sS https://example.com/some/very/long/path/that/pushed/the/line/past/its/limit · rule Bash.curl · yes = run once";
+const REAL_FLOOR_ASK = "ACP (Agentic Control Plane) asks: Run a destructive command (destructive floor: force-push). This asks in every workspace and policy mode\n  git push --force origin main · rule Bash.git.push · yes = run once";
+
+test("(f) a real gateway ask already names once/allow: the human gets only the one thing it lacks, /acp-why — once per session per key", async () => {
+  const sid = "sess-hold-next-1";
+  nextResponse = { decision: "ask", reason: REAL_ASK, approval_id: "ap4", approval_status: "pending" };
+  const out = await runHook(preToolUse({ session_id: sid }));
+  assert.equal(out.systemMessage, `${REAL_ASK}\n/acp-why explains.`, "nothing the dialog already says is repeated");
+  // The dialog the model reads is unchanged: the gateway's reason + steer.
+  assert.ok(out.hookSpecificOutput.permissionDecisionReason.startsWith(`${REAL_ASK}\n\n`));
+  assert.doesNotMatch(out.hookSpecificOutput.permissionDecisionReason, /acp-why/);
+
+  // Same tool key, same session: the hint does not repeat.
+  const again = await runHook(preToolUse({ session_id: sid }));
+  assert.equal(again.systemMessage, REAL_ASK);
+
+  // The gateway dropped its /acp-allow hint for length: supply it, with
+  // the key parsed from "· rule <ToolKey> ·", not from the command text.
+  nextResponse = { decision: "ask", reason: REAL_ASK_NO_HINT, approval_id: "ap5", approval_status: "pending" };
+  const other = await runHook(preToolUse({ session_id: sid, tool_input: { command: "curl https://example.com" } }));
+  assert.equal(other.systemMessage, `${REAL_ASK_NO_HINT}\n/acp-allow Bash.curl to stop being asked for this tool. /acp-why explains.`);
+});
+
+test("(f2) legacy prose 'step_up by … policy for <ToolKey>.' still yields the full next step, key without the sentence stop", async () => {
+  nextResponse = { decision: "ask", reason: "step_up by interactive tier policy for Bash.git.push. Yes runs it once.", approval_id: "ap4b", approval_status: "pending" };
+  const out = await runHook(preToolUse({ session_id: "sess-hold-legacy-1" }));
+  const lines = out.systemMessage.split("\n");
+  assert.equal(lines[0], "[ACP] Approval required: step_up by interactive tier policy for Bash.git.push. Yes runs it once.");
+  assert.equal(lines[1], "Approve once here, or /acp-allow Bash.git.push to stop being asked for this tool. /acp-why explains.");
+  assert.equal(lines.length, 2);
+  assert.ok(!/governance|step-up/i.test(lines[1]), "plain words only");
+});
+
+test("(g) a safety-floor ask says no rule stops it, and never suggests /acp-allow — by action text or by rule_label", async () => {
+  nextResponse = { decision: "ask", reason: REAL_FLOOR_ASK, approval_id: "ap6", approval_status: "pending" };
+  const out = await runHook(preToolUse({ session_id: "sess-hold-floor-1", tool_input: { command: "git push --force" } }));
+  assert.equal(out.systemMessage, `${REAL_FLOOR_ASK}\nThis is the safety floor, so no rule stops the asking. /acp-why explains.`);
+  assert.doesNotMatch(out.systemMessage, /acp-allow/);
+
+  nextResponse = { decision: "ask", reason: "ACP (Agentic Control Plane) asks: Remove ACP from this machine\n  acp-uninstall · rule Bash.acp-uninstall · yes = run once · /acp-allow Bash.acp-uninstall", rule_label: "uninstall floor: acp-uninstall", approval_id: "ap6b", approval_status: "pending" };
+  const typed = await runHook(preToolUse({ session_id: "sess-hold-floor-2", tool_input: { command: "acp-uninstall" } }));
+  assert.match(typed.systemMessage, /\nThis is the safety floor, so no rule stops the asking\. \/acp-why explains\.$/);
+});
+
+test("(h) an ask with no named rule gets the short hint and no /acp-allow guess", async () => {
+  nextResponse = { decision: "ask", reason: "approval required", approval_id: "ap7", approval_status: "pending" };
+  const out = await runHook(preToolUse({ session_id: "sess-hold-norule-1" }));
+  assert.equal(out.systemMessage, "[ACP] Approval required: approval required\nApprove once here. /acp-why explains.");
+});
+
+test("(i) under codex the hold is a deny with the console route, and carries no terminal next-step line", async () => {
+  nextResponse = { decision: "ask", reason: REAL_ASK, approval_id: "ap8", approval_status: "pending" };
+  const out = await runHook(preToolUse({ session_id: "sess-hold-codex-1" }), { ACP_HARNESS: "codex", ACP_CLIENT: "codex-plugin" });
+  assert.equal(out.hookSpecificOutput?.permissionDecision, "deny");
+  assert.doesNotMatch(out.systemMessage ?? "", /Approve once here|acp-why/);
 });
 
 test("(e) PostToolUse never sends a capabilities field", async () => {

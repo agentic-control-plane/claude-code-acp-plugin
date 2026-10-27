@@ -1,6 +1,6 @@
 ---
 name: acp-enforce
-description: Turn enforcement on for this workspace — the starter rules start asking before risky calls run. You confirm with one tap.
+description: "Turn enforce on for this workspace — your rules apply (starter rules ask first before rm and keychain reads). You confirm with one tap."
 user-invocable: true
 ---
 

@@ -422,6 +422,12 @@ const POST_HOOK_PAYLOAD_CEILING = 200 * 1024;
 function stripControl(v) {
   return String(v ?? "").replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f‪-‮⁦-⁩]/g, " ");
 }
+// For fields that are ONE line by contract (state_line, catch_up): line
+// breaks and tabs become spaces too, so a gateway value can never split the
+// human channel into extra lines.
+function oneLine(v) {
+  return stripControl(v).replace(/[\r\n\t]+/g, " ").trim();
+}
 
 // Hostname-only form of ACP_API for env-var injection (e.g. GH_HOST).
 // gh CLI accepts hostnames, not URLs — strip protocol + trailing slash.
@@ -506,6 +512,44 @@ const LAUNCHER_BY_CLIENT = {
 const NOTICE_DIR = join(homedir(), ".acp", "session-notices");
 const NOTICE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const NOTICE_MAX_FILES = 200;
+// The one install/update command the human runs themselves. Same form the
+// installer, the acp-upgrade skill and the marketing site print — keep the
+// shell (`| bash`) identical everywhere (gsc#1699 ws2 item 4).
+const INSTALL_CMD = "curl -sf https://agenticcontrolplane.com/install.sh | bash";
+// Safety-floor clauses of the copy-contract short form (gsc#1699): the two
+// tiers, in the words every ACP surface uses.
+const STATE_BLOCKED = "always blocked: rm -rf ~, disk wipes";
+const STATE_ASKS = "held for your OK: force-push, DROP, curl|sh";
+// Prune the session-notice directory so it cannot grow without bound: drop
+// markers past the TTL, and never keep more than NOTICE_MAX_FILES (newest
+// win). Opportunistic — every failure is swallowed.
+function pruneNoticeDir() {
+  try {
+    const cutoff = Date.now() - NOTICE_TTL_MS;
+    const files = readdirSync(NOTICE_DIR).map((n) => {
+      const f = join(NOTICE_DIR, n); let m = 0;
+      try { m = statSync(f).mtimeMs; } catch { /* vanished */ }
+      return { f, m };
+    }).sort((a, b) => b.m - a.m);
+    files.forEach((x, i) => { if (x.m < cutoff || i >= NOTICE_MAX_FILES) { try { unlinkSync(x.f); } catch { /* raced */ } } });
+  } catch { /* pruning is opportunistic */ }
+}
+// True the FIRST time `name` is claimed for this session, false ever after —
+// including from a parallel hook process for the same session: the marker
+// is created with an exclusive flag, so exactly one caller wins. No session
+// id → no marker → false (bias to silence). Never throws. This is the
+// per-session gate every once-per-session human line goes through, so ACP
+// never becomes a line people learn to skip.
+function onceThisSession(name) {
+  try {
+    const id = String(input?.session_id ?? "").replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 120);
+    if (!id) return false;
+    mkdirSync(NOTICE_DIR, { recursive: true });
+    writeFileSync(join(NOTICE_DIR, `${name}-${id}`), new Date().toISOString(), { flag: "wx" });
+    pruneNoticeDir();
+    return true;
+  } catch { return false; }
+}
 // Are this session's MODEL calls routed through the ACP proxy? Narrower than
 // launchedViaLauncher() on purpose: ACP_KEY authenticates the hook and can be
 // exported by someone running plain `claude`, whose model calls still go
@@ -534,33 +578,25 @@ function claimUnpricedNotice() {
     mkdirSync(NOTICE_DIR, { recursive: true });
     try { writeFileSync(join(NOTICE_DIR, `unpriced-${id}`), new Date().toISOString(), { flag: "wx" }); }
     catch { return null; }
-    // Prune so the directory cannot grow without bound: drop markers past
-    // the TTL, and never keep more than NOTICE_MAX_FILES (newest win).
-    try {
-      const cutoff = Date.now() - NOTICE_TTL_MS;
-      const files = readdirSync(NOTICE_DIR).map((n) => {
-        const f = join(NOTICE_DIR, n); let m = 0;
-        try { m = statSync(f).mtimeMs; } catch { /* vanished */ }
-        return { f, m };
-      }).sort((a, b) => b.m - a.m);
-      files.forEach((x, i) => { if (x.m < cutoff || i >= NOTICE_MAX_FILES) { try { unlinkSync(x.f); } catch { /* raced */ } } });
-    } catch { /* pruning is opportunistic */ }
+    pruneNoticeDir();
     const [bin, launcher] = pair;
     // A marketplace-only install (`claude plugin install`) has this hook but
     // no launcher yet: point at the installer, not at a path that is absent.
     const how = existsSync(join(homedir(), ".acp", "bin", launcher))
-      ? `launch with \`${launcher}\` (~/.acp/bin/${launcher})`
-      : `install the \`${launcher}\` launcher: curl -sf https://agenticcontrolplane.com/install.sh | bash`;
+      ? `launch with \`${launcher}\``
+      : `install the \`${launcher}\` launcher (${INSTALL_CMD}) and launch with it`;
     // Since 0.18.0 a session whose payload names a readable transcript IS
     // priced — from the transcript, at API-rate equivalents (see
-    // collectTranscriptUsage). Say what they have, then what still needs
-    // the launcher: the policy half. A harness whose payload carries no
-    // transcript gets nothing priced, and the notice says so.
+    // collectTranscriptUsage). Say what they have, then the one thing the
+    // launcher adds that a human cares about: exact model cost. A harness
+    // whose payload carries no transcript gets nothing priced, and the
+    // notice says so. Plain English, one line (gsc#1699 ws2 item 5); the
+    // policy half (redaction, routing) is in the README, not the terminal.
     const costed = typeof input?.transcript_path === "string" && input.transcript_path && existsSync(input.transcript_path);
     if (costed) {
-      return `[ACP] Tool calls in this session are checked and logged, and model-call cost is estimated from the session transcript (API-rate equivalent, not a metered charge). Model calls are not policy-checked: plain \`${bin}\` sends them straight to the provider, so tool-result redaction and model routing are off. For those, ${how}. Shown once per session.`;
+      return `[ACP] Tool calls are checked. Cost here is estimated — ${how} for exact model cost.`;
     }
-    return `[ACP] Tool calls in this session are checked and logged. Model calls are not: plain \`${bin}\` sends them straight to the provider, so they are neither priced nor policy-checked (tool-result redaction, model routing). For the cost X-ray and model-call policy, ${how}. Shown once per session.`;
+    return `[ACP] Tool calls are checked. Model cost is not recorded for plain \`${bin}\` — ${how} to record it.`;
   } catch { return null; }
 }
 
@@ -945,6 +981,18 @@ async function runLocal(input) {
     }));
     return;
   }
+  // One state line per session (gsc#1699 ws2 item 3). In local mode the
+  // bundled engine runs BOTH floor tiers itself, so the full contract form
+  // is true here without asking anyone. Nothing else to decide at
+  // SessionStart — no tool call, so no audit row.
+  if (ev === "SessionStart") {
+    if (onceThisSession("state")) {
+      process.stdout.write(JSON.stringify({
+        systemMessage: `[ACP] local — your rules in ~/.acp/policy.json apply · ${STATE_BLOCKED} · ${STATE_ASKS}`,
+      }));
+    }
+    return;
+  }
   const { decide } = ENGINE;
   const ctx = await readContext(input);
   const d = decide(input.tool_name, input.tool_input, policy, { ...(ctx || {}), harness: HARNESS, cwd: input.cwd });
@@ -1144,12 +1192,22 @@ function readVersionHeaders(res) {
   };
 }
 
+// The command the HUMAN runs to update: `acp-update` when the installer
+// wrote it (~/.acp/bin/acp-update runs the canonical installer), else the
+// installer itself — a marketplace-only install has this hook but no bin.
+function updateCommand(hasBinary) {
+  return hasBinary ? "acp-update" : INSTALL_CMD;
+}
+
+// Two severities, worded for the human (gsc#1699 ws2 item 4): below the
+// minimum the gateway still supports means some protections may not apply
+// — update now; merely behind the latest is informational.
 function staleNoticeText({ current, latest, minGood, updateCmd = "acp-update" }) {
   if (minGood && compareSemver(current, minGood) < 0) {
-    return `[ACP] governance hook v${current} is below the minimum supported v${minGood} — denies may not be enforced. Run: ${updateCmd}`;
+    return `[ACP] This hook is v${current}, below the minimum v${minGood} — some protections may not apply. Update now: ${updateCmd}`;
   }
   if (latest && compareSemver(current, latest) < 0) {
-    return `[ACP] governance hook v${current} is outdated (v${latest} current). Run: ${updateCmd}`;
+    return `[ACP] A newer ACP hook is available (v${latest}; this is v${current}). Update: ${updateCmd}`;
   }
   return null;
 }
@@ -1180,7 +1238,10 @@ function staleHookNotice(res, data) {
       ?? (typeof data?.latestVersion === "string" && data.latestVersion.trim() ? data.latestVersion.trim() : null);
     const minGood = fromHeaders.minGood
       ?? (typeof data?.minGoodVersion === "string" && data.minGoodVersion.trim() ? data.minGoodVersion.trim() : null);
-    const text = staleNoticeText({ current: PLUGIN_VERSION, latest, minGood, updateCmd: "acp-update" });
+    const text = staleNoticeText({
+      current: PLUGIN_VERSION, latest, minGood,
+      updateCmd: updateCommand(existsSync(join(ACP_DIR, "bin", "acp-update"))),
+    });
     if (!text) return null;
     if (!shouldNoticeNow({ markerPath: STALE_NOTICE_MARKER })) return null;
     process.stderr.write(text + "\n");
@@ -1320,15 +1381,27 @@ async function handlePreToolUse() {
     const held = approvalMeta(verdict);
     rememberPendingApproval(held);
     if (held) receiptVerdictHint = "held";
-    const steer =/\bacp_wait_approval\b/.test(reason) ? WAIT_STEER : STEER_BY_KIND[kind]
-      || (UNPROPOSABLE.test(reason) ? STEER_BY_KIND.terminal : STEER_BY_KIND.reformulate);
+    // A rate-limit deny is capacity, not a rule (gsc#1699 ws2 item 1): no
+    // human can allow or fix it, so it must not read "Denied by policy".
+    // The gateway types it kind:"retry"; the reason text is the fallback
+    // for a gateway older than the typed field — and that fallback used to
+    // fall through to the "propose a rule" steer, sending the agent to file
+    // a rule against a rate limit. Busy always carries the retry steer.
+    const busy = kind === "retry" || (kind == null && /\brate.?limit/i.test(reason));
+    const steer = /\bacp_wait_approval\b/.test(reason) ? WAIT_STEER
+      : busy ? STEER_BY_KIND.retry
+      : STEER_BY_KIND[kind] || (UNPROPOSABLE.test(reason) ? STEER_BY_KIND.terminal : STEER_BY_KIND.reformulate);
+    const humanLine = busy
+      ? "[ACP] Busy — too many calls at once; retrying this call is safe."
+      : `[ACP] Denied by policy: ${reason}`;
+    const modelLine = busy ? `[ACP] Busy: ${reason}` : humanLine;
     process.stdout.write(JSON.stringify({
       hookSpecificOutput: {
         hookEventName: "PreToolUse",
         permissionDecision: "deny",
-        permissionDecisionReason: `[ACP] Denied by policy: ${reason}\n\n${steer}`,
+        permissionDecisionReason: `${modelLine}\n\n${steer}`,
       },
-      systemMessage: [recoveryLine, `[ACP] Denied by policy: ${reason}`].filter(Boolean).join("\n"),
+      systemMessage: [recoveryLine, humanLine].filter(Boolean).join("\n"),
     }));
     process.exit(0);
   }
@@ -1474,15 +1547,63 @@ async function handlePreToolUse() {
     const headline = /^(?:ACP \(Agentic Control Plane\)|\[ACP\])/.test(reason)
       ? reason
       : `[ACP] Approval required: ${reason}`;
+    // Human next step (gsc#1699 ws2 item 2, #1472): the dialog says what is
+    // held; this says what to do about it — approve once here, or the one
+    // command that stops the asking for this tool. Only where the human is
+    // actually being asked in this terminal (never on the Codex deny path),
+    // and once per session per tool key, so a run of holds on the same
+    // tool does not repeat it. A safety-floor ask says truthfully that no
+    // rule turns it off.
+    const nextStep = decision === "ask" ? holdNextStep(reason, verdict) : null;
     process.stdout.write(JSON.stringify({
       hookSpecificOutput: {
         hookEventName: "PreToolUse",
         permissionDecision: decision,
         permissionDecisionReason: `${headline}\n\n${steer}`,
       },
-      systemMessage: [recoveryLine, headline].filter(Boolean).join("\n"),
+      systemMessage: [recoveryLine, headline, nextStep].filter(Boolean).join("\n"),
     }));
     process.exit(0);
+  }
+  function holdNextStep(reason, verdict) {
+    try {
+      // Today's gateway (govern/harnessAsk.ts harnessAskReason) sends:
+      //   ACP (Agentic Control Plane) asks: <action>
+      //     agent says: "<description>"                     (optional)
+      //     <command> · rule <ToolKey> · yes = run once · /acp-allow <ToolKey>
+      // and drops the /acp-allow hint when that line would run long. Floors
+      // explain themselves in the action: "(destructive floor: …)" /
+      // "(uninstall floor: …)", or arrive typed as rule_label. The older
+      // "step_up by <tier> policy for <ToolKey>" prose is the fallback.
+      // Say only what the gateway has NOT already said: never repeat a
+      // hint the dialog carries. The ToolKey is exactly what /acp-allow
+      // accepts (e.g. Bash.git.push); no key → no allow hint, never a guess.
+      const label = typeof verdict?.rule_label === "string" ? verdict.rule_label : "";
+      const floor = /\((?:destructive|uninstall|hardline) floor:/i.test(reason)
+        || /\b(?:destructive|uninstall|hardline) floor\b/i.test(label)
+        || /^\s*(?:\[ACP\]\s*)?(hardline floor|governance surface|uninstall floor|destructive floor)\b/i.test(reason);
+      const saysOnce = /\byes = run once\b/.test(reason);
+      const saysAllow = /\/acp-allow\b/.test(reason);
+      const m = /(?:^\s*|· )rule ([A-Za-z][A-Za-z0-9_.:-]{0,79}) · yes = run once/m.exec(reason)
+        || /\b(?:denied|step_up|defer) by [^\n]{1,80}? policy for ([A-Za-z][A-Za-z0-9_.:-]{0,79})/.exec(reason);
+      // Legacy prose ends the key with a sentence stop ("… for Bash.git.");
+      // never hand that to /acp-allow.
+      const key = !floor && m ? m[1].replace(/[.:]+$/, "") || null : null;
+      const once = saysOnce ? "" : "Approve once here";
+      let line;
+      let cls;
+      if (floor) {
+        line = `${once ? `${once}. ` : ""}This is the safety floor, so no rule stops the asking. /acp-why explains.`;
+        cls = "hold-floor";
+      } else if (saysAllow || !key) {
+        line = `${once ? `${once}. ` : ""}/acp-why explains.`;
+        cls = key ? `hold-${key.replace(/[^A-Za-z0-9._-]/g, "_")}` : "hold-other";
+      } else {
+        line = `${once ? `${once}, or ` : ""}/acp-allow ${key} to stop being asked for this tool. /acp-why explains.`;
+        cls = `hold-${key.replace(/[^A-Za-z0-9._-]/g, "_")}`;
+      }
+      return onceThisSession(cls) ? line : null;
+    } catch { return null; }
   }
 
   // Step 1: policy check.
@@ -2081,6 +2202,43 @@ function sha256FileHex(path) {
   }
 }
 
+// One state line per session (gsc#1699 ws2 item 3, #1351): what ACP is doing
+// for this workspace right now, in the shared copy-contract short form. Only
+// what is TRUE for this tenant is said:
+//   - `state_line`: a gateway-rendered line wins outright — the gateway
+//     knows the mode and whether the "asks first" floor tier is live for
+//     this tenant (its rollout stage), and this hook does not.
+//   - else `mode` ("audit" | "enforce") composes the contract form; the
+//     "asks first" clause appears only when `floor_asks_first` is true;
+//     `rules` (integer) fills "N rules apply".
+//   - else (today's gateway sends none of these) only what every tenant
+//     has in every mode: recording, and the always-blocked tier.
+// All three fields are optional; absent → the clause is omitted. The line
+// is claimed through the per-session marker, so a resume or compaction that
+// re-fires SessionStart does not repeat it. STATE_BLOCKED / STATE_ASKS are
+// declared beside NOTICE_DIR: runLocal() runs at module top level before
+// this point, and a `const` here would still be in its dead zone there.
+function sessionStateLine(data) {
+  try {
+    if (!data || typeof data !== "object") return null;
+    if (!onceThisSession("state")) return null;
+    if (typeof data.state_line === "string" && data.state_line.trim()) {
+      return oneLine(data.state_line).slice(0, 300);
+    }
+    const mode = data.mode === "audit" || data.mode === "enforce" ? data.mode : null;
+    if (mode === "enforce") {
+      const n = Number.isInteger(data.rules) && data.rules >= 0
+        ? `${data.rules} rule${data.rules === 1 ? "" : "s"} apply`
+        : "your rules apply";
+      return `[ACP] enforce — ${n} · plus the safety floor · /acp-status`;
+    }
+    if (mode === "audit") {
+      return ["[ACP] audit — recording", STATE_BLOCKED, ...(data.floor_asks_first === true ? [STATE_ASKS] : []), "/acp-enforce to apply your rules"].join(" · ");
+    }
+    return `[ACP] recording · ${STATE_BLOCKED} · /acp-status for your mode and rules`;
+  } catch { return null; }
+}
+
 async function handleSessionStart() {
   // Connect moment (plugin#29): a session starting with a key and a
   // non-empty ledger is either a fresh connect or the first session after
@@ -2102,11 +2260,15 @@ async function handleSessionStart() {
   let offer = null;
   let catchUp = null;
   let upgradeOnce = null;
+  let stateLine = null;
+  let staleOnce = null;
   const finish = () => {
-    // Human channel, in order: ledger flush, #1351 catch_up, the human-worded
-    // upgrade line (at most once per 24h), then the daily offer. One JSON
-    // object however many apply (#51).
-    const systemMessage = [flushNotice, catchUp, upgradeOnce, offer].filter(Boolean).join("\n");
+    // Human channel, in order: ledger flush, the one-per-session state line
+    // (gsc#1699 ws2 item 3), #1351 catch_up, the human-worded upgrade line
+    // (at most once per 24h), the stale-hook line (names a command the
+    // HUMAN runs, so it is theirs, not the model's), then the daily offer.
+    // One JSON object however many apply (#51).
+    const systemMessage = [flushNotice, stateLine, catchUp, upgradeOnce, staleOnce, offer].filter(Boolean).join("\n");
     if (context || systemMessage) {
       process.stdout.write(JSON.stringify({
         ...(context ? { hookSpecificOutput: { hookEventName: "SessionStart", additionalContext: context } } : {}),
@@ -2152,27 +2314,38 @@ async function handleSessionStart() {
     // Stale-hook line: headers first, then the attest body's
     // latestVersion / minGoodVersion. Appended to the upgrade notice when
     // both are present, never replacing it.
-    const staleNotice = staleHookNotice(res, data);
+    staleOnce = staleHookNotice(res, data);
     // #1351's upgrade_notice (human-worded, ends "/acp-upgrade") supersedes
     // the older model-facing `data.notice` upgrade text per CONTRACT.md §4:
     // when present, it is shown to the human only, at most once per 24h
     // per machine, and the older text is NOT also forwarded to the model.
+    // `data.notice` stays the MODEL's channel: it is what lets the agent
+    // drive the approval-gated upgrade (skills/acp-upgrade) when asked.
     const newUpgrade = data && typeof data.upgrade_notice === "string" && data.upgrade_notice.trim()
       ? data.upgrade_notice.trim()
       : null;
     const upgradeNotice = !newUpgrade && data && typeof data.notice === "string" && data.notice.trim()
       ? data.notice.trim()
       : null;
-    context = [upgradeNotice, staleNotice].filter(Boolean).join("\n") || null;
+    context = upgradeNotice || null;
+    // The state line describes a workspace this key is attested into. A
+    // rejected attest (401 unauthenticated, 429, a tombstoned workspace's
+    // ok:false) describes nothing — say nothing, and leave the session's
+    // marker unclaimed so a later successful start can still say it.
+    stateLine = res.ok && data && data.ok !== false ? sessionStateLine(data) : null;
     // catch_up (#1351): one human line since this user's previous session
     // start. Shown every SessionStart it's present on — the gateway itself
     // bounds how often it has anything to say (cap 7 days, ≥60s cache).
     catchUp = data && typeof data.catch_up === "string" && data.catch_up.trim()
-      ? stripControl(data.catch_up).trim()
+      ? oneLine(data.catch_up)
       : null;
     upgradeOnce = newUpgrade && shouldNoticeNow({ markerPath: UPGRADE_NOTICE_MARKER, ttlMs: UPGRADE_NOTICE_TTL_MS })
       ? newUpgrade
       : null;
+    // One update command for the human, not two: when the gateway's own
+    // upgrade line fires, the version-header line is redundant — unless it
+    // carries the below-minimum severity, which the human must still see.
+    if (upgradeOnce && staleOnce && !/below the minimum/.test(staleOnce)) staleOnce = null;
   } catch {
     // silent — absence of attestation is visible server-side by design
   } finally {
