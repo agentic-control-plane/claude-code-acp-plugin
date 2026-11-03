@@ -20,7 +20,21 @@ already fixed upstream.
 
 ## How to upgrade
 
-1. Run the canonical installer, exactly:
+1. If ACP runs as the Claude Code **plugin** (the normal case — `claude
+   plugin list` shows `agentic-control-plane@acp`), the only command that
+   switches the active version is:
+
+   ```bash
+   claude plugin update agentic-control-plane@acp
+   ```
+
+   Re-running the installer does NOT upgrade an installed plugin
+   (`claude plugin install` is a no-op on one that is already installed —
+   acp-install#64), so do not send the user back to the installer for this.
+
+   If ACP runs as a **standalone hook** (`~/.acp/govern.mjs` wired directly
+   in `~/.claude/settings.json`, no plugin listed), run the canonical
+   installer, exactly:
 
    ```bash
    curl -sf https://agenticcontrolplane.com/install.sh | bash
@@ -33,13 +47,14 @@ already fixed upstream.
    Do not modify the command, add flags, or chain other commands onto it:
    only the exact canonical form is recognized.
 
-2. After the installer finishes, tell the user to **restart their session**
-   (the running session keeps the old hook in memory).
+2. Either way, tell the user to **restart Claude Code** (the running
+   session keeps the old hook in memory).
 
 3. On the next session start the hook re-attests: the console session view
    shows the new version and hash. If the badge still shows the old
-   version, the installer did not take — check `~/.acp/govern.mjs` was
-   rewritten and `claude plugin list` shows the current plugin version.
+   version, the update did not take — `claude plugin list` should show the
+   version in `~/.claude/plugins/marketplaces/acp/.claude-plugin/marketplace.json`
+   (plugin), or `~/.acp/govern.mjs` should have been rewritten (standalone).
 
 ## Never
 
