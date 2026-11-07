@@ -127,7 +127,7 @@ const ACP_GOVERN = ACP_DEV_BASE ?? resolveAcpBase(
 // beside it. Agreement with plugin.json / marketplace.json is enforced by
 // scripts/validate-manifest.mjs and test/plugin-version.test.mjs
 // (gatewaystack-connect#1538 item 6).
-const PLUGIN_VERSION = "0.29.5";
+const PLUGIN_VERSION = "0.29.6";
 
 // Console base for user-facing deep links (session receipt, #606; enrolment
 // hint). Validated like the gateway bases: a poisoned value would otherwise
@@ -1171,16 +1171,61 @@ function shouldNoticeNow({ markerPath, now = Date.now(), ttlMs = STALE_NOTICE_TT
   }
 }
 
+// The higher of two version strings; a side that doesn't parse loses.
+function newerOf(a, b) {
+  const pa = parseSemver(a);
+  const pb = parseSemver(b);
+  if (!pa && !pb) return null;
+  if (!pa) return b.trim();
+  if (!pb) return a.trim();
+  return compareSemver(a, b) < 0 ? b.trim() : a.trim();
+}
+
+// acp-install#64: the LOCAL marketplace clone's manifest version.
+// `claude plugin marketplace update` refreshes it but never switches the
+// active plugin, so a machine can sit on 0.27.0 with 0.29.5 on disk and
+// the gateway's hand-set registry value behind both. Reading the clone
+// makes the notice correct offline and independent of any constant.
+function localMarketplaceVersion() {
+  try {
+    const pluginsDir = join(homedir(), ".claude", "plugins");
+    let location = join(pluginsDir, "marketplaces", "acp");
+    try {
+      const known = JSON.parse(readFileSync(join(pluginsDir, "known_marketplaces.json"), "utf8"));
+      const loc = known?.acp?.installLocation;
+      if (typeof loc === "string" && loc.trim()) location = loc.trim();
+    } catch { /* no registry file: default location */ }
+    const manifest = JSON.parse(readFileSync(join(location, ".claude-plugin", "marketplace.json"), "utf8"));
+    const entry = Array.isArray(manifest?.plugins) ? manifest.plugins.find((p) => p?.name === "agentic-control-plane") : null;
+    return parseSemver(entry?.version) ? entry.version.trim() : null;
+  } catch {
+    return null;
+  }
+}
+
+// The command that actually moves THIS install forward. A marketplace
+// plugin (Claude Code sets CLAUDE_PLUGIN_ROOT and runs the hook from
+// ~/.claude/plugins/) is only upgraded by `claude plugin update`; the
+// installer's `plugin install` is a no-op on an installed plugin
+// (acp-install#64). A standalone ~/.acp/govern.mjs is refreshed by acp-update.
+const UPDATE_CMD = (
+  (typeof process.env.CLAUDE_PLUGIN_ROOT === "string" && process.env.CLAUDE_PLUGIN_ROOT.trim())
+  || /[\\/]\.claude[\\/]plugins[\\/]/.test(fileURLToPath(import.meta.url))
+) ? "claude plugin update agentic-control-plane@acp — then restart Claude Code" : "acp-update";
+
 /** Headers (any hook response) and/or the attest body fields → the notice
- *  line, already written to stderr, or null. Sync, never throws. */
+ *  line, already written to stderr, or null. Sync, never throws. The
+ *  "current" version is the higher of what the gateway sent and what the
+ *  local marketplace clone holds — never a constant in this file. */
 function staleHookNotice(res, data) {
   try {
     const fromHeaders = readVersionHeaders(res);
-    const latest = fromHeaders.latest
+    const gatewayLatest = fromHeaders.latest
       ?? (typeof data?.latestVersion === "string" && data.latestVersion.trim() ? data.latestVersion.trim() : null);
+    const latest = newerOf(gatewayLatest, localMarketplaceVersion());
     const minGood = fromHeaders.minGood
       ?? (typeof data?.minGoodVersion === "string" && data.minGoodVersion.trim() ? data.minGoodVersion.trim() : null);
-    const text = staleNoticeText({ current: PLUGIN_VERSION, latest, minGood, updateCmd: "acp-update" });
+    const text = staleNoticeText({ current: PLUGIN_VERSION, latest, minGood, updateCmd: UPDATE_CMD });
     if (!text) return null;
     if (!shouldNoticeNow({ markerPath: STALE_NOTICE_MARKER })) return null;
     process.stderr.write(text + "\n");
