@@ -127,7 +127,7 @@ const ACP_GOVERN = ACP_DEV_BASE ?? resolveAcpBase(
 // beside it. Agreement with plugin.json / marketplace.json is enforced by
 // scripts/validate-manifest.mjs and test/plugin-version.test.mjs
 // (gatewaystack-connect#1538 item 6).
-const PLUGIN_VERSION = "0.29.6";
+const PLUGIN_VERSION = "0.29.7";
 
 // Console base for user-facing deep links (session receipt, #606; enrolment
 // hint). Validated like the gateway bases: a poisoned value would otherwise
@@ -2671,7 +2671,7 @@ function handleSessionEnd() {
 // writes to the transcript. That is fine by design: the link executes only
 // the intent the human already typed, as that human, once, inside its TTL
 // — nothing a reader of the transcript can redirect.
-const INTENT_COMMAND_RE = /(?:^|:)acp-(enforce|audit|allow|ask|deny|judge|apply|status|why|approve|notify)$/;
+const INTENT_COMMAND_RE = /(?:^|:)acp-(enforce|audit|allow|ask|deny|judge|apply|status|why|approve|notify|unset)$/;
 
 function blockExpansion(reason) {
   process.stdout.write(JSON.stringify({ decision: "block", reason }));
@@ -2735,8 +2735,15 @@ async function handleUserPromptExpansion() {
       if (!res.ok || !s?.ok) {
         blockExpansion(`[ACP] Couldn't read workspace status (HTTP ${res.status}). Console: ${ACP_CONSOLE}/policies`);
       }
+      // Each interactive rule names the command that removes it
+      // (/acp-unset) — only where terminal
+      // commands are on, so the hint never points at a 404.
+      const safeTool = (v) => String(v ?? "").replace(/[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g, " ").slice(0, 80);
       const rules = Array.isArray(s.rules) && s.rules.length
-        ? s.rules.map((r) => `  ${r.tool}: ${r.interactive === "step_up" ? "ask" : r.interactive ?? "-"}`).join("\n")
+        ? s.rules.map((r) => {
+            const unset = s.terminalIntents === true && r.interactive && /^[A-Za-z][A-Za-z0-9_.:-]{0,79}$/.test(String(r.tool)) ? `   /acp-unset ${r.tool}` : "";
+            return `  ${safeTool(r.tool)}: ${r.interactive === "step_up" ? "ask" : r.interactive ?? "-"}${unset}`;
+          }).join("\n")
         : "  (no per-tool rules)";
       const proposals = Array.isArray(s.proposals) && s.proposals.length
         ? "\nProposals waiting for you:\n" + s.proposals.map((p) => `  ${p.id}  ${p.tool} → ${p.permission === "step_up" ? "ask" : p.permission}  (${p.source ?? "agent"})   /acp-apply ${p.id}`).join("\n")
@@ -2777,6 +2784,11 @@ async function handleUserPromptExpansion() {
     const data = await res.json().catch(() => null);
     if (res.status === 404 && data?.error === "not-rolled-out") {
       blockExpansion(`[ACP] Terminal commands aren't on for this workspace yet. Console: ${ACP_CONSOLE}/policies`);
+    }
+    // /acp-unset refusals are complete sentences ("No rule for X in acme…",
+    // "Only a workspace owner or admin…"): print them as the answer.
+    if (kind === "unset" && (data?.error === "no-rule" || data?.error === "admin-required") && typeof data?.hint === "string" && data.hint) {
+      blockExpansion(`[ACP] ${data.hint}`);
     }
     if (!res.ok || !data?.ok) {
       const hint = data?.hint ? ` ${data.hint}` : "";

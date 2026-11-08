@@ -459,3 +459,67 @@ test("(n1) /acp-notify off files an intent with its target, like the rule comman
   assert.ok(post, "posts to /plugin/intents");
   assert.deepEqual({ kind: post.body.kind, target: post.body.target }, { kind: "notify", target: "off" });
 });
+
+// ── /acp-unset <tool> (internal tracker) ─────────────────────────────
+
+test("(u1) /acp-unset <tool> files kind unset with the first token, prints the emailed-confirm text, never a link", async () => {
+  nextResponse = { ok: true, status: "sent", to: "d***@example.com", kind: "unset", target: "Bash.curl.embracethered.com", describe: "Remove the interactive rule for Bash.curl.embracethered.com in acme, so it falls back to the workspace default.", expiresInSeconds: 600 };
+  const out = await runHook(expansion({ command_name: "agentic-control-plane:acp-unset", command_args: "Bash.curl.embracethered.com extra" }));
+  const req = seen.find((s) => s.url === "/plugin/intents");
+  assert.ok(req, "expected a POST to /plugin/intents");
+  assert.equal(req.method, "POST");
+  assert.equal(req.body.kind, "unset");
+  assert.equal(req.body.target, "Bash.curl.embracethered.com");
+  assert.equal(req.headers.authorization, "Bearer gsk_test_deadbeef");
+  assert.equal(out.decision, "block");
+  assert.match(out.reason, /Remove the interactive rule for Bash\.curl\.embracethered\.com/);
+  assert.match(out.reason, /Confirm link emailed to d\*\*\*@example\.com/);
+  assert.match(out.reason, /Nothing changes until you confirm/);
+  assert.ok(!/https:\/\//.test(out.reason), "no link in the blocked expansion");
+});
+
+test("(u2) /acp-unset on a tool with no rule prints the gateway's 'No rule for X' sentence", async () => {
+  nextStatus = 404;
+  nextResponse = { ok: false, error: "no-rule", hint: "No rule for Bash.git in acme, so there is nothing to remove. /acp-status lists the rules by their exact names." };
+  const out = await runHook(expansion({ command_name: "agentic-control-plane:acp-unset", command_args: "Bash.git" }));
+  assert.equal(out.decision, "block");
+  assert.equal(out.reason, "[ACP] No rule for Bash.git in acme, so there is nothing to remove. /acp-status lists the rules by their exact names.");
+});
+
+test("(u3) /acp-unset by a member prints that an owner or admin must remove it", async () => {
+  nextStatus = 403;
+  nextResponse = { ok: false, error: "admin-required", hint: "Only a workspace owner or admin can remove a workspace rule. Ask one to run /acp-unset, or to remove it in the console: https://cloud.agenticcontrolplane.com/policies" };
+  const out = await runHook(expansion({ command_name: "agentic-control-plane:acp-unset", command_args: "Bash.rm" }));
+  assert.match(out.reason, /^\[ACP\] Only a workspace owner or admin/);
+});
+
+test("(u4) a subagent's /acp-unset never files anything: no request, no output", async () => {
+  const out = await runHook(expansion({ command_name: "agentic-control-plane:acp-unset", command_args: "Bash.rm", agent_id: "sub-1" }));
+  assert.equal(out, null);
+  assert.equal(seen.length, 0);
+});
+
+test("(u5) an agent-authored tool call naming /acp-unset is not a terminal intent: nothing is filed", async () => {
+  // The model cannot author UserPromptExpansion; what it can emit is a
+  // tool call. That goes through PreToolUse governance, never the intent
+  // route, so it cannot file a removal (the confirm also needs the human's
+  // emailed link, which the key never receives — gateway #1275 F1).
+  nextResponse = { decision: "allow" };
+  await runHook({ hook_event_name: "PreToolUse", session_id: "sess-intents-1", tool_name: "Skill", tool_input: { skill: "agentic-control-plane:acp-unset", args: "Bash.rm" } });
+  assert.equal(seen.some((s) => s.url.startsWith("/plugin/intents")), false);
+});
+
+test("(u6) /acp-status prints the /acp-unset hint next to each interactive rule, only when terminal commands are on", async () => {
+  nextStatusResponse = statusOf({ mode: "enforce", terminalIntents: true, rules: [
+    { tool: "Bash.curl.embracethered.com", interactive: "step_up" },
+    { tool: "Bash.rm", interactive: "deny" },
+    { tool: "Bash.bg", interactive: null },
+  ] });
+  const out = await runStatus();
+  assert.match(out.reason, /Bash\.curl\.embracethered\.com: ask {3}\/acp-unset Bash\.curl\.embracethered\.com/);
+  assert.match(out.reason, /Bash\.rm: deny {3}\/acp-unset Bash\.rm/);
+  assert.match(out.reason, /Bash\.bg: -$/m, "no hint for a tool with no interactive rule");
+  nextStatusResponse = statusOf({ mode: "enforce", rules: [{ tool: "Bash.rm", interactive: "deny" }] });
+  const off = await runStatus();
+  assert.ok(!/acp-unset/.test(off.reason), "no hint when the gateway doesn't report terminal commands on");
+});
