@@ -43,7 +43,7 @@
 // always fails open on token-request errors and surfaces a stderr warning;
 // future versions will respect the server's `scopedTokensFailMode` policy.
 
-import { readFileSync, appendFileSync, existsSync, mkdirSync, writeFileSync, unlinkSync, readdirSync, statSync, openSync, readSync, closeSync } from "fs";
+import { readFileSync, appendFileSync, existsSync, mkdirSync, writeFileSync, unlinkSync, readdirSync, statSync, openSync, readSync, closeSync, chmodSync } from "fs";
 import { homedir } from "os";
 import { join, isAbsolute } from "path";
 import { createHash } from "crypto";
@@ -127,7 +127,7 @@ const ACP_GOVERN = ACP_DEV_BASE ?? resolveAcpBase(
 // beside it. Agreement with plugin.json / marketplace.json is enforced by
 // scripts/validate-manifest.mjs and test/plugin-version.test.mjs
 // (gatewaystack-connect#1538 item 6).
-const PLUGIN_VERSION = "0.29.6";
+const PLUGIN_VERSION = "0.30.0";
 
 // Console base for user-facing deep links (session receipt, #606; enrolment
 // hint). Validated like the gateway bases: a poisoned value would otherwise
@@ -1365,6 +1365,10 @@ async function handlePreToolUse() {
     const held = approvalMeta(verdict);
     rememberPendingApproval(held);
     if (held) receiptVerdictHint = "held";
+    // Headless auto-resume: the deny below is unchanged; under the
+    // claude-acp launcher's -p runner the hold is also recorded so the
+    // launcher can wait for the decision and resume the session afterwards.
+    recordHeadlessHold(reason, verdict, held);
     const steer =/\bacp_wait_approval\b/.test(reason) ? WAIT_STEER : STEER_BY_KIND[kind]
       || (UNPROPOSABLE.test(reason) ? STEER_BY_KIND.terminal : STEER_BY_KIND.reformulate);
     process.stdout.write(JSON.stringify({
@@ -2368,6 +2372,45 @@ function writePending(sessionId, list) {
   try {
     mkdirSync(SESSION_STATS_DIR, { recursive: true });
     writeFileSync(pendingPath(sessionId), JSON.stringify(Array.isArray(list) ? list.slice(-20) : []));
+  } catch { /* bookkeeping must never touch the call path */ }
+}
+
+// ── Headless holds file (auto-resume after approval) ──
+// A held call is ALWAYS denied (the harness sees no change). When the
+// claude-acp launcher's -p runner is driving this session (ACP_HEADLESS=1,
+// Claude Code only), the hold is also appended to
+// ~/.acp/holds/<session_id>.json (0600) as a list of
+// {approvalId, code, toolUseId, tool, ts}, one entry per approvalId.
+// After the run exits the launcher waits for each decision and resumes the
+// session with a prompt that says what was decided. Nothing here changes
+// the decision, so a missing or failed write only means no auto-resume.
+const HOLD_REASON = /^\s*approval-(?:requested|pending):([A-Za-z0-9_-]+)/;
+const HOLDS_DIR = join(homedir(), ".acp", "holds");
+function recordHeadlessHold(reason, verdict, meta) {
+  try {
+    if (process.env.ACP_HEADLESS !== "1") return;
+    if (ACP_CLIENT !== "claude-code-plugin" || !IS_CLAUDE_CODE) return;
+    const m = HOLD_REASON.exec(String(reason ?? ""));
+    if (!m) return;
+    const approvalId = typeof verdict?.approval_id === "string" && verdict.approval_id ? verdict.approval_id : m[1];
+    const sid = String(input?.session_id ?? "").replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 120);
+    if (!sid || sid === "unknown") return;
+    mkdirSync(HOLDS_DIR, { recursive: true, mode: 0o700 });
+    const p = join(HOLDS_DIR, `${sid}.json`);
+    let list = [];
+    try { const prev = JSON.parse(readFileSync(p, "utf8")); if (Array.isArray(prev)) list = prev; } catch { /* new file */ }
+    if (list.some((e) => e && e.approvalId === approvalId)) return;
+    // Nothing derived from tool input goes in this file: the launcher's
+    // resume prompt is built from it, so only the tool key and ids.
+    list.push({
+      approvalId,
+      code: meta?.code || approvalId.replace(/[^0-9a-fA-F]/g, "").slice(0, 4).toUpperCase(),
+      toolUseId: input.tool_use_id ?? null,
+      tool: String(input.tool_name ?? "").replace(/[^A-Za-z0-9._:-]/g, "").slice(0, 64) || null,
+      ts: new Date().toISOString(),
+    });
+    writeFileSync(p, JSON.stringify(list.slice(-50)), { mode: 0o600 });
+    chmodSync(p, 0o600);
   } catch { /* bookkeeping must never touch the call path */ }
 }
 
