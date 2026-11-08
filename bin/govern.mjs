@@ -2736,7 +2736,7 @@ async function handleUserPromptExpansion() {
         blockExpansion(`[ACP] Couldn't read workspace status (HTTP ${res.status}). Console: ${ACP_CONSOLE}/policies`);
       }
       // Each interactive rule names the command that removes it
-      // (/acp-unset, gatewaystack-connect#1949) — only where terminal
+      // (/acp-unset) — only where terminal
       // commands are on, so the hint never points at a 404.
       const safeTool = (v) => String(v ?? "").replace(/[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g, " ").slice(0, 80);
       const rules = Array.isArray(s.rules) && s.rules.length

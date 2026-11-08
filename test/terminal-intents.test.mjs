@@ -460,7 +460,7 @@ test("(n1) /acp-notify off files an intent with its target, like the rule comman
   assert.deepEqual({ kind: post.body.kind, target: post.body.target }, { kind: "notify", target: "off" });
 });
 
-// ── gatewaystack-connect#1949: /acp-unset <tool> ─────────────────────
+// ── /acp-unset <tool> (internal tracker) ─────────────────────────────
 
 test("(u1) /acp-unset <tool> files kind unset with the first token, prints the emailed-confirm text, never a link", async () => {
   nextResponse = { ok: true, status: "sent", to: "d***@example.com", kind: "unset", target: "Bash.curl.embracethered.com", describe: "Remove the interactive rule for Bash.curl.embracethered.com in acme, so it falls back to the workspace default.", expiresInSeconds: 600 };
