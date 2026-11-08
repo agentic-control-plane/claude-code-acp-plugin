@@ -43,7 +43,7 @@
 // always fails open on token-request errors and surfaces a stderr warning;
 // future versions will respect the server's `scopedTokensFailMode` policy.
 
-import { readFileSync, appendFileSync, existsSync, mkdirSync, writeFileSync, unlinkSync, readdirSync, statSync, openSync, readSync, closeSync, chmodSync } from "fs";
+import { readFileSync, appendFileSync, existsSync, mkdirSync, writeFileSync, unlinkSync, readdirSync, statSync, lstatSync, openSync, readSync, closeSync, chmodSync } from "fs";
 import { homedir } from "os";
 import { join, isAbsolute } from "path";
 import { createHash } from "crypto";
@@ -2358,9 +2358,23 @@ function pendingPath(sessionId) {
   return join(SESSION_STATS_DIR, `${safe}.pending.json`);
 }
 
+// A path we may read or overwrite: absent, or a regular file. A FIFO here
+// would block readFileSync/writeFileSync past the hook's 5s timeout, and
+// Claude Code treats a PreToolUse timeout as non-blocking — the held call
+// would RUN. Symlinks and directories are refused too.
+function plainFileOrAbsent(p) {
+  try { return lstatSync(p).isFile(); } catch (e) { return e?.code === "ENOENT"; }
+}
+// A directory we may create files in: a real directory, not a symlink.
+function realDirOrAbsent(p) {
+  try { return lstatSync(p).isDirectory(); } catch (e) { return e?.code === "ENOENT"; }
+}
+
 function readPending(sessionId) {
   try {
-    const raw = JSON.parse(readFileSync(pendingPath(sessionId), "utf8"));
+    const p = pendingPath(sessionId);
+    if (!plainFileOrAbsent(p)) return [];
+    const raw = JSON.parse(readFileSync(p, "utf8"));
     return Array.isArray(raw) ? raw : [];
   } catch {
     return [];
@@ -2371,19 +2385,24 @@ function writePending(sessionId, list) {
   if (!sessionId || sessionId === "unknown") return;
   try {
     mkdirSync(SESSION_STATS_DIR, { recursive: true });
-    writeFileSync(pendingPath(sessionId), JSON.stringify(Array.isArray(list) ? list.slice(-20) : []));
+    const p = pendingPath(sessionId);
+    if (!plainFileOrAbsent(p)) return;
+    writeFileSync(p, JSON.stringify(Array.isArray(list) ? list.slice(-20) : []));
   } catch { /* bookkeeping must never touch the call path */ }
 }
 
 // ── Headless holds file (auto-resume after approval) ──
 // A held call is ALWAYS denied (the harness sees no change). When the
 // claude-acp launcher's -p runner is driving this session (ACP_HEADLESS=1,
-// Claude Code only), the hold is also appended to
-// ~/.acp/holds/<session_id>.json (0600) as a list of
-// {approvalId, code, toolUseId, tool, ts}, one entry per approvalId.
-// After the run exits the launcher waits for each decision and resumes the
-// session with a prompt that says what was decided. Nothing here changes
-// the decision, so a missing or failed write only means no auto-resume.
+// Claude Code only), the hold is also written to
+// ~/.acp/holds/<session_id>/<approvalId>.json (0600, dirs 0700) as
+// {approvalId, code, toolUseId, tool, ts}. One file per approval, created
+// with O_EXCL ("wx"): parallel hooks in one turn cannot lose each other's
+// hold, and a repeat hold for the same approval is a no-op. After the run
+// exits the launcher waits for the decisions and resumes the session with a
+// fixed prompt. Nothing here changes the decision: any failure (including a
+// symlink, FIFO or directory where a file should be) skips the write and
+// the deny goes out as always.
 const HOLD_REASON = /^\s*approval-(?:requested|pending):([A-Za-z0-9_-]+)/;
 const HOLDS_DIR = join(homedir(), ".acp", "holds");
 function recordHeadlessHold(reason, verdict, meta) {
@@ -2393,25 +2412,27 @@ function recordHeadlessHold(reason, verdict, meta) {
     const m = HOLD_REASON.exec(String(reason ?? ""));
     if (!m) return;
     const approvalId = typeof verdict?.approval_id === "string" && verdict.approval_id ? verdict.approval_id : m[1];
+    if (!/^[A-Za-z0-9_-]{8,64}$/.test(approvalId)) return;
     const sid = String(input?.session_id ?? "").replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 120);
-    if (!sid || sid === "unknown") return;
+    if (!sid || sid === "unknown" || sid === "." || sid === "..") return;
+    const dir = join(HOLDS_DIR, sid);
+    if (!realDirOrAbsent(HOLDS_DIR)) return;
     mkdirSync(HOLDS_DIR, { recursive: true, mode: 0o700 });
-    const p = join(HOLDS_DIR, `${sid}.json`);
-    let list = [];
-    try { const prev = JSON.parse(readFileSync(p, "utf8")); if (Array.isArray(prev)) list = prev; } catch { /* new file */ }
-    if (list.some((e) => e && e.approvalId === approvalId)) return;
+    chmodSync(HOLDS_DIR, 0o700); // mkdir does not tighten an existing dir
+    if (!realDirOrAbsent(dir)) return;
+    mkdirSync(dir, { mode: 0o700, recursive: true });
+    chmodSync(dir, 0o700);
+    const p = join(dir, `${approvalId}.json`);
     // Nothing derived from tool input goes in this file: the launcher's
     // resume prompt is built from it, so only the tool key and ids.
-    list.push({
+    writeFileSync(p, JSON.stringify({
       approvalId,
       code: meta?.code || approvalId.replace(/[^0-9a-fA-F]/g, "").slice(0, 4).toUpperCase(),
       toolUseId: input.tool_use_id ?? null,
       tool: String(input.tool_name ?? "").replace(/[^A-Za-z0-9._:-]/g, "").slice(0, 64) || null,
       ts: new Date().toISOString(),
-    });
-    writeFileSync(p, JSON.stringify(list.slice(-50)), { mode: 0o600 });
-    chmodSync(p, 0o600);
-  } catch { /* bookkeeping must never touch the call path */ }
+    }), { mode: 0o600, flag: "wx" });
+  } catch { /* EEXIST = already recorded; anything else: bookkeeping must never touch the call path */ }
 }
 
 // Pulls the new optional approval_* fields (CONTRACT.md §1) off a deny/ask
