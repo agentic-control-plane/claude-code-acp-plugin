@@ -127,7 +127,7 @@ const ACP_GOVERN = ACP_DEV_BASE ?? resolveAcpBase(
 // beside it. Agreement with plugin.json / marketplace.json is enforced by
 // scripts/validate-manifest.mjs and test/plugin-version.test.mjs
 // (gatewaystack-connect#1538 item 6).
-const PLUGIN_VERSION = "0.30.0";
+const PLUGIN_VERSION = "0.30.1";
 
 // Console base for user-facing deep links (session receipt, #606; enrolment
 // hint). Validated like the gateway bases: a poisoned value would otherwise
@@ -1381,20 +1381,36 @@ async function handlePreToolUse() {
     }));
     process.exit(0);
   }
+  // Operator opt-in to fail closed (restored 2026-11-08). The docs and the
+  // bundled fallback hook have always offered `echo closed > ~/.acp/failmode`
+  // (or ACP_FAIL_MODE=closed), but this canonical hook ignored it, so an
+  // operator who set it still ran interactive calls ungoverned during an
+  // outage. Same read order as the fallback: env first, then the file.
+  // Only "closed" changes anything, and only toward stricter: it makes the
+  // interactive tier block too. Unattended tiers are already closed, and
+  // nothing here can open them. Read failures mean "not set" (never-brick).
+  function operatorFailMode() {
+    const env = (process.env.ACP_FAIL_MODE || "").trim().toLowerCase();
+    if (env) return env;
+    try { return readFileSync(join(homedir(), ".acp", "failmode"), "utf8").trim().toLowerCase(); }
+    catch { return ""; }
+  }
+  const OPERATOR_FAIL_CLOSED = operatorFailMode() === "closed";
   // Unreachability posture (#385, decided 2026-07-21): fail-open is the
   // universal default and every lapse is LOUD (never-brick). An ACP outage
   // must not freeze every governed interactive session at once — a human is
   // present to read the warning. Unattended tiers (subagent/background/api)
   // have nobody watching, so for them the block IS the safety net: they
   // stay fail-closed. Policy denies are unaffected — this is only about
-  // not being able to ASK the policy.
+  // not being able to ASK the policy. An operator can opt the interactive
+  // tier into fail-closed too (OPERATOR_FAIL_CLOSED above).
   function failPostureOnOutage(detail) {
     const tier = resolveAgentTier();
     // Floors first, in every tier (plugin#29): an outage never lets a
     // hardline or destructive call through, and the row is in the ledger
     // for the flush that follows recovery.
     if (applyOfflineFloors(input, "unreachable")) process.exit(0);
-    if (tier === "interactive") {
+    if (tier === "interactive" && !OPERATOR_FAIL_CLOSED) {
       ledgerRecord(input, { decision: "allow", source: "ungoverned", reason: `gateway unreachable (${detail})`, mode: "unreachable" });
       // Lapse, loudly, and leave an audit trail ACP never saw.
       try {
@@ -1436,7 +1452,9 @@ async function handlePreToolUse() {
     } catch { /* the lapse log is best-effort — never block on it */ }
     recordPendingLapse(input.session_id, input.tool_name, `fail-closed (${tier} tier): ${detail}`);
     ledgerRecord(input, { decision: "deny", source: "fail-closed", reason: `gateway unreachable (${detail})`, mode: "unreachable" });
-    const outageMsg = `[ACP] Gateway unreachable (${detail}) — ${tier} tier stays blocked when policy can't be consulted (fail-closed for unattended agents; interactive sessions fail open).`;
+    const outageMsg = tier === "interactive"
+      ? `[ACP] Gateway unreachable (${detail}) — call blocked because this machine is set to fail closed (~/.acp/failmode or ACP_FAIL_MODE). Remove that setting to let interactive calls run ungoverned during an outage instead.`
+      : `[ACP] Gateway unreachable (${detail}) — ${tier} tier stays blocked when policy can't be consulted (fail-closed for unattended agents; interactive sessions fail open).`;
     process.stdout.write(JSON.stringify({
       hookSpecificOutput: {
         hookEventName: "PreToolUse",
@@ -1469,8 +1487,9 @@ async function handlePreToolUse() {
       ? "The ACP workspace this machine was connected to has been deleted. To remove ACP from this machine: acp-uninstall (older installs without it: curl -sf https://agenticcontrolplane.com/uninstall.sh | bash). To keep using ACP, re-run the installer: curl -sf https://agenticcontrolplane.com/install.sh | bash"
       : "Fix: re-run the installer (curl -sf https://agenticcontrolplane.com/install.sh | bash) or create a key at https://cloud.agenticcontrolplane.com/settings/api-keys and save it: echo 'gsk_...' > ~/.acp/credentials";
     if (applyOfflineFloors(input, "key-rejected")) process.exit(0);
-    ledgerRecord(input, { decision: tier === "interactive" ? "allow" : "deny", source: tier === "interactive" ? "ungoverned" : "fail-closed", reason: `key rejected (HTTP ${status})`, mode: "key-rejected" });
-    if (tier === "interactive") {
+    const failOpen = tier === "interactive" && !OPERATOR_FAIL_CLOSED;
+    ledgerRecord(input, { decision: failOpen ? "allow" : "deny", source: failOpen ? "ungoverned" : "fail-closed", reason: `key rejected (HTTP ${status})`, mode: "key-rejected" });
+    if (failOpen) {
       try {
         appendFileSync(join(homedir(), ".acp", "lapse.log"),
           JSON.stringify({ at: new Date().toISOString(), tool: input.tool_name, tier, detail: `key rejected (HTTP ${status})` }) + "\n");
