@@ -1,6 +1,6 @@
 # Agentic Control Plane: Claude Code Plugin
 
-Checks every Claude Code tool call against your rules before it runs, and logs it. That covers `Bash`, `Read`, `Write`, `Edit`, `WebFetch` and all MCP tools. By default the rules and the log live on your machine. Connect a team workspace and they live there instead. Your tools and your workflow don't change.
+Checks every Claude Code tool call against your rules before it runs, and logs it. That covers `Bash`, `Read`, `Write`, `Edit`, `WebFetch` and all MCP tools. With `--local` the rules and the log stay on your machine. The default install connects a workspace, and they live there. Your tools and your workflow don't change.
 
 The check runs as a Claude Code hook on your machine. If hooks are switched off (`disableAllHooks`), nothing is checked.
 
@@ -38,9 +38,10 @@ Interactive sessions proceed with a loud `UNGOVERNED` warning, and the floors be
 
 To block interactive calls during an outage too, run `echo closed > ~/.acp/failmode` or set `ACP_FAIL_MODE=closed` (works from plugin 0.30.1). It only tightens: it never opens a blocked tier. Anyone with shell access can delete that file, so it is a setting, not a lock.
 
-When ACP denies or blocks a call, the message starts with one of three prefixes so you can tell the cause at a glance:
+When ACP denies or blocks a call, the message starts with one of these prefixes so you can tell the cause at a glance:
 
 - `[ACP] Denied by policy: <reason>`: a rule blocked the call.
+- `[ACP] Blocked by the safety floor: ...`: the on-device floor stopped it (the destructive and uninstall floors use similar `[ACP]` prefixes).
 - `[ACP] Gateway unreachable (...)`: ACP didn't answer. This is an availability failure, not a judgment about the call.
 - `[ACP] Key rejected (HTTP 401/403)`: the key in `~/.acp/credentials` is revoked or invalid.
 
@@ -48,10 +49,10 @@ When ACP denies or blocks a call, the message starts with one of three prefixes 
 
 Whenever the gateway cannot see a call (no key on this machine yet, key present but gateway unreachable, or `--local` mode) the hook still does two things:
 
-1. **Applies the two floors.** The hardline floor denies catastrophic commands: wiping root or home, formatting disks, fork bombs. The destructive floor asks a human before a force push, destructive SQL handed to a database client, a remote download piped into a shell, or a recursive delete outside the working directory. Everything else proceeds with a loud warning. The floors read what will *execute*, not what appears: a heredoc written to a file or a quoted string never trips them.
+1. **Applies the floors.** There is also an uninstall floor that guards ACP's own files. The hardline floor denies catastrophic commands: wiping root or home, formatting disks, fork bombs. The destructive floor asks a human before a force push, destructive SQL handed to a database client, a remote download piped into a shell, or a recursive delete outside the working directory. Everything else follows the outage rules above (interactive proceeds with a warning, unattended stays blocked); in `--local` mode your `policy.json` decides. The floors read what will *execute*, not what appears: a heredoc written to a file or a quoted string never trips them.
 2. **Records the call** to `~/.acp/ledger.jsonl`: tool, classification, decision, reason, timestamp, session. Bounded at 5 MB. Nothing leaves the machine without a key.
 
-When a key is connected (or the gateway comes back), the ledger uploads once, in the background, and the calls appear in your workspace audit with their original timestamps. Connect after two weeks of local use and the console shows two weeks of history. Buffered rows are a record, not a decision: they are never re-evaluated against workspace policy, and they never count as new agents on your plan.
+When a key is connected (or the gateway comes back), the ledger uploads once, in the background, and the calls appear in your workspace audit with their original timestamps. Connect after two weeks of local use and the console shows two weeks of history. Buffered rows are a record, not a decision: they are never re-evaluated against workspace policy.
 
 An owner or admin can switch the destructive floor off on the Policies page. The hardline floor cannot be configured.
 
@@ -131,7 +132,8 @@ Per-harness recipes: https://agenticcontrolplane.com/docs/enterprise
 
 ```bash
 # Pause (keep credentials). The floors still apply and calls are
-# recorded to ~/.acp/ledger.jsonl, but nothing reaches your workspace.
+# recorded to ~/.acp/ledger.jsonl, and nothing reaches your workspace
+# until you resume (the buffered ledger uploads then).
 mv ~/.acp/credentials ~/.acp/credentials.paused
 
 # Resume
