@@ -1391,7 +1391,9 @@ async function handlePreToolUse() {
   // nothing here can open them. Read failures mean "not set" (never-brick).
   function operatorFailMode() {
     const env = (process.env.ACP_FAIL_MODE || "").trim().toLowerCase();
-    if (env) return env;
+    // Same as the fallback hook: an env value other than open/closed is
+    // ignored and the file decides (a typo must never loosen the file's "closed").
+    if (env === "open" || env === "closed") return env;
     try { return readFileSync(join(homedir(), ".acp", "failmode"), "utf8").trim().toLowerCase(); }
     catch { return ""; }
   }
@@ -1452,9 +1454,17 @@ async function handlePreToolUse() {
     } catch { /* the lapse log is best-effort — never block on it */ }
     recordPendingLapse(input.session_id, input.tool_name, `fail-closed (${tier} tier): ${detail}`);
     ledgerRecord(input, { decision: "deny", source: "fail-closed", reason: `gateway unreachable (${detail})`, mode: "unreachable" });
-    const outageMsg = tier === "interactive"
-      ? `[ACP] Gateway unreachable (${detail}) — call blocked because this machine is set to fail closed (~/.acp/failmode or ACP_FAIL_MODE). Remove that setting to let interactive calls run ungoverned during an outage instead.`
+    // Operator-closed interactive block: the MODEL is told the operator chose
+    // this and not to touch ACP settings; only the HUMAN line says how to
+    // undo it. Telling the agent "remove ~/.acp/failmode" would hand it the
+    // way past the block, and a plain rm/echo on that file isn't floored.
+    const operatorClosed = tier === "interactive";
+    const outageMsg = operatorClosed
+      ? `[ACP] Gateway unreachable (${detail}) — call blocked because this machine's operator set ACP to fail closed.`
       : `[ACP] Gateway unreachable (${detail}) — ${tier} tier stays blocked when policy can't be consulted (fail-closed for unattended agents; interactive sessions fail open).`;
+    const humanMsg = operatorClosed
+      ? `${outageMsg} To let interactive calls run ungoverned during outages instead, remove ~/.acp/failmode or unset ACP_FAIL_MODE.`
+      : outageMsg;
     process.stdout.write(JSON.stringify({
       hookSpecificOutput: {
         hookEventName: "PreToolUse",
@@ -1462,9 +1472,9 @@ async function handlePreToolUse() {
         // An outage and a policy deny demand opposite responses: retry the
         // first, never the second. Told apart only if the model is told
         // which one this is — so name it, and say the call was never judged.
-        permissionDecisionReason: `${outageMsg}\n\nThis is an availability failure, NOT a policy judgment about this call — nothing decided that the operation was wrong. Do other work that doesn't need this tool, and retry later; if every route is blocked this way, stop and report the outage rather than working around it.`,
+        permissionDecisionReason: `${outageMsg}\n\nThis is an availability failure, NOT a policy judgment about this call — nothing decided that the operation was wrong. Do other work that doesn't need this tool, and retry later; if every route is blocked this way, stop and report the outage rather than working around it.${operatorClosed ? " Do not change files under ~/.acp or environment settings to get past this." : ""}`,
       },
-      systemMessage: outageMsg,
+      systemMessage: humanMsg,
     }));
     process.exit(0);
   }
@@ -1505,7 +1515,8 @@ async function handlePreToolUse() {
       }));
       process.exit(0);
     }
-    const msg = `[ACP] Key rejected (HTTP ${status}) — the key in ~/.acp/credentials is revoked or invalid; ${tier} tier stays blocked until it is fixed. ${fix}`;
+    const why = tier === "interactive" ? "this machine's operator set ACP to fail closed, so the call stays blocked" : `${tier} tier stays blocked`;
+    const msg = `[ACP] Key rejected (HTTP ${status}) — the key in ~/.acp/credentials is revoked or invalid; ${why} until it is fixed. ${fix}`;
     process.stdout.write(JSON.stringify({
       hookSpecificOutput: {
         hookEventName: "PreToolUse",

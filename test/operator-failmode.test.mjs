@@ -55,10 +55,11 @@ function freshHome(failmodeFile) {
   return home;
 }
 
-function runHook(home, base, env = {}) {
+function runHook(home, base, env = {}, extraInput = {}) {
   const input = {
     hook_event_name: "PreToolUse", tool_name: "Bash", tool_input: { command: "echo hi" },
     session_id: `sess-${Math.random().toString(36).slice(2)}`, permission_mode: "default",
+    ...extraInput,
   };
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [GOVERN], {
@@ -95,11 +96,40 @@ test("default: an interactive call still fails open when the gateway is unreacha
   assert.match(out.systemMessage, /UNGOVERNED/);
 });
 
-test("~/.acp/failmode = closed: the interactive call is blocked, and the reason names the setting", async () => {
+test("~/.acp/failmode = closed: the interactive call is blocked; only the human is told how to undo it", async () => {
   const out = await runHook(freshHome("closed\n"), deadBase);
   assert.equal(decision(out), "deny");
-  assert.match(out.hookSpecificOutput.permissionDecisionReason, /fail closed \(~\/\.acp\/failmode or ACP_FAIL_MODE\)/);
-  assert.match(out.hookSpecificOutput.permissionDecisionReason, /availability failure, NOT a policy judgment/);
+  const reason = out.hookSpecificOutput.permissionDecisionReason;
+  assert.match(reason, /operator set ACP to fail closed/);
+  assert.match(reason, /availability failure, NOT a policy judgment/);
+  assert.match(reason, /Do not change files under ~\/\.acp/);
+  // The agent must not be handed the way past the block.
+  assert.doesNotMatch(reason, /remove ~\/\.acp\/failmode|unset ACP_FAIL_MODE/);
+  assert.match(out.systemMessage, /remove ~\/\.acp\/failmode or unset ACP_FAIL_MODE/);
+});
+
+test("an env value that isn't open/closed is ignored, and the file's closed still holds", async () => {
+  const out = await runHook(freshHome("closed"), deadBase, { ACP_FAIL_MODE: "strict" });
+  assert.equal(decision(out), "deny");
+});
+
+test("a 5xx from the gateway is treated like an outage under closed", async () => {
+  const s = createServer((req, res) => { req.resume(); req.on("end", () => { res.statusCode = 503; res.end("unavailable"); }); });
+  await new Promise((r) => s.listen(0, LOOPBACK, r));
+  try {
+    const base = `http://${LOOPBACK}:${s.address().port}`;
+    assert.equal(decision(await runHook(freshHome(), base)), "allow", "default still fails open on 5xx");
+    assert.equal(decision(await runHook(freshHome("closed"), base)), "deny");
+  } finally { s.close(); }
+});
+
+test("a subagent call stays blocked whatever the switch says", async () => {
+  const sub = async (home) => {
+    const input = { agent_id: "agent-123" };
+    return runHook(home, deadBase, {}, input);
+  };
+  assert.equal(decision(await sub(freshHome())), "deny");
+  assert.equal(decision(await sub(freshHome("open"))), "deny");
 });
 
 test("ACP_FAIL_MODE=closed works without the file, and env wins over the file", async () => {
