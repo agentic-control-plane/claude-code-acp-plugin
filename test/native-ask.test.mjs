@@ -131,7 +131,7 @@ test("(a) Claude Code PreToolUse declares native_ask and carries permission_mode
   await runHook(preToolUse());
   const req = seen.find((s) => s.url === "/govern/tool-use");
   assert.ok(req, "expected a request to /govern/tool-use");
-  assert.deepEqual(req.body.capabilities, ["native_ask", "input_rewrite"]);
+  assert.deepEqual(req.body.capabilities, ["native_ask"]);
   assert.equal(req.body.permission_mode, "default");
   assert.equal(req.body.call_id, "call-native-ask-1");
 });
@@ -221,8 +221,8 @@ for (const [label, env] of [
     await runHook(preToolUse(), env);
     const req = seen.find((s) => s.url === "/govern/tool-use");
     assert.ok(req, "expected a request to /govern/tool-use");
-    // qwen-code applies a rewritten tool_input; Cursor's dialect is unverified.
-    assert.deepEqual(req.body.capabilities, /qwen/.test(label) ? ["input_rewrite"] : []);
+    // Bash input is never rewritten, so even qwen-code declares nothing here.
+    assert.deepEqual(req.body.capabilities, []);
     assert.equal(Object.prototype.hasOwnProperty.call(req.body, "attended"), false);
   });
 

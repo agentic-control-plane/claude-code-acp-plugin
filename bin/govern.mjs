@@ -436,77 +436,107 @@ function stripControl(v) {
 //   Copilot CLI   in: modifiedArgs                        out: modifiedResult (text)
 //   Codex         none (its parser rejects updatedInput; see HARNESS note)
 //   Cursor, VS Code Copilot, others: none
+// Copilot's rewrite fields (modifiedArgs / modifiedResult) are unverified by a
+// real run, and Copilot CLI has ignored updatedInput before. The apply code
+// below stays, but nothing declares the capability until this flips.
+const COPILOT_REWRITE_VERIFIED = false;
 function rewriteHarness() {
+  // VS Code's dialect (even when it arrives through ~/.claude/settings.json)
+  // drops these fields: no capabilities, no rewrite fields.
+  if (ACP_CLIENT === "copilot-vscode") return null;
   const client = `${process.env.ACP_CLIENT ?? ""} ${process.env.ACP_HARNESS ?? ""}`;
   if (HARNESS === "codex" || /cursor/i.test(client)) return null;
   if (/qwen-code/i.test(client)) return "qwen";
-  if (HARNESS === "copilot") return ACP_CLIENT === "copilot-vscode" ? null : "copilot";
+  if (HARNESS === "copilot") return "copilot";
   return IS_CLAUDE_CODE ? "claude" : null;
 }
 const isPlainObject = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
 
+// Input rewrite is declared only for tools whose input goes to an outside
+// party (MCP, WebFetch, WebSearch). Commands and file edits are never
+// rewritten: the gateway's block policy covers them, redaction belongs on
+// the output.
+const inputRewriteTool = (name) => typeof name === "string" && (/^mcp__/.test(name) || name === "WebFetch" || name === "WebSearch");
+
+// Output rewrite only for response shapes proven against real Claude Code:
+// Bash {stdout,...}, Read of a text file, MCP text content (string, or an
+// array of text blocks). Images, PDF/notebook Read, Grep/Glob, WebFetch and
+// Agent are not declared until proven.
+function outputRewriteProven(name, r) {
+  if (typeof name !== "string") return false;
+  if (name === "Bash") return isPlainObject(r) && typeof r.stdout === "string";
+  if (name === "Read") return isPlainObject(r) && r.type === "text" && isPlainObject(r.file) && typeof r.file.content === "string";
+  if (/^mcp__/.test(name)) {
+    return typeof r === "string" || (Array.isArray(r) && r.length > 0 && r.every((b) => isPlainObject(b) && b.type === "text" && typeof b.text === "string"));
+  }
+  return false;
+}
+
 // Capabilities for one call. `toolResponse` is the PostToolUse payload (omit
-// on PreToolUse); output_rewrite needs a response the gateway can echo back
-// in the same shape and that fit under the payload ceiling.
-function rewriteCapabilities(toolResponse) {
+// on PreToolUse); output_rewrite needs a proven response shape the gateway
+// can echo back, which fit under the payload ceiling.
+function rewriteCapabilities(toolName, toolResponse, phase = "pre") {
   const h = rewriteHarness();
   const caps = [];
-  if (h) caps.push("input_rewrite");
-  const echoable = toolResponse !== undefined && toolResponse !== null && (typeof toolResponse === "object" || typeof toolResponse === "string");
-  if ((h === "claude" || h === "copilot") && echoable) caps.push("output_rewrite");
+  if (!h || (h === "copilot" && !COPILOT_REWRITE_VERIFIED)) return caps;
+  if (phase === "pre" && inputRewriteTool(toolName)) caps.push("input_rewrite");
+  if (phase === "post" && (h === "claude") && toolResponse !== undefined && toolResponse !== null && outputRewriteProven(toolName, toolResponse)) caps.push("output_rewrite");
   return caps;
 }
 
-// Same top-level shape: Claude Code silently ignores an updatedToolOutput that
-// does not match the tool's output schema, so a mismatched rewrite is dropped
-// here (and nothing is claimed) rather than shipped.
+// Deep structural match: same keys, same types, array lengths equal,
+// recursing into objects and array elements. Claude Code silently ignores an
+// updatedToolOutput that does not match the tool's output schema, so a
+// mismatch anywhere is dropped (and nothing is claimed) rather than shipped.
 function sameShape(orig, mod) {
-  if (typeof orig === "string") return typeof mod === "string";
-  if (Array.isArray(orig)) return Array.isArray(mod);
-  if (!isPlainObject(orig) || !isPlainObject(mod)) return false;
+  if (orig === null || mod === null) return orig === mod;
+  if (typeof orig !== typeof mod) return false;
+  if (Array.isArray(orig) || Array.isArray(mod)) {
+    return Array.isArray(orig) && Array.isArray(mod) && orig.length === mod.length && orig.every((x, i) => sameShape(x, mod[i]));
+  }
+  if (typeof orig !== "object") return true;
   const ok = Object.keys(orig), mk = Object.keys(mod);
-  if (ok.length !== mk.length || !ok.every((k) => k in mod)) return false;
-  return ok.every((k) => {
-    const a = orig[k], b = mod[k];
-    return (a === null) === (b === null) && Array.isArray(a) === Array.isArray(b) && typeof a === typeof b;
-  });
+  return ok.length === mk.length && ok.every((k) => k in mod && sameShape(orig[k], mod[k]));
 }
 
-// Validated rewrite of tool_input, or null (not declared, malformed, throws).
-function pickInputRewrite(data, toolInput) {
+// Validated rewrite of tool_input, or null (not declared, key set differs,
+// throws). Merged over the original so no field can be dropped.
+function pickInputRewrite(data, toolName, toolInput) {
   try {
-    if (!rewriteHarness() || !isPlainObject(data?.modified_input) || !isPlainObject(toolInput)) return null;
+    if (!rewriteCapabilities(toolName).includes("input_rewrite")) return null;
+    if (!isPlainObject(data?.modified_input) || !isPlainObject(toolInput)) return null;
     const mod = data.modified_input;
-    if (typeof toolInput.command === "string" && typeof mod.command !== "string") return null;
-    return mod;
+    const a = Object.keys(toolInput).sort(), b = Object.keys(mod).sort();
+    if (a.length !== b.length || a.some((k, i) => k !== b[i])) return null;
+    if (!Object.keys(mod).every((k) => typeof mod[k] === typeof toolInput[k] && Array.isArray(mod[k]) === Array.isArray(toolInput[k]))) return null;
+    return { ...toolInput, ...mod };
   } catch { return null; }
 }
 
-// Harness-shaped PreToolUse output fields carrying `mod` (allow + rewrite).
+// Harness-shaped PreToolUse output carrying `mod`. Deliberately NO
+// permissionDecision: a PII rewrite must not skip the harness's own ask
+// rules or default-mode prompts (only the vendor-token path says "allow").
 function inputRewriteOutput(mod) {
-  const hso = { hookEventName: "PreToolUse", permissionDecision: "allow" };
-  if (rewriteHarness() === "copilot") return { hookSpecificOutput: hso, modifiedArgs: mod };
-  return { hookSpecificOutput: { ...hso, updatedInput: mod } };
+  if (rewriteHarness() === "copilot") return { modifiedArgs: mod };
+  return { hookSpecificOutput: { hookEventName: "PreToolUse", updatedInput: mod } };
 }
 
 // Harness-shaped PostToolUse fields carrying the rewrite, or null.
-function pickOutputRewrite(data, toolResponse) {
+function pickOutputRewrite(data, toolName, toolResponse) {
   try {
-    const h = rewriteHarness();
-    if (h === "claude") {
-      let cand = data?.modified_tool_response;
-      if (cand === undefined && typeof toolResponse === "string") cand = data?.modified_output;
-      if (cand === undefined || cand === null || !sameShape(toolResponse, cand)) return null;
-      return { hookSpecificOutput: { updatedToolOutput: cand } };
-    }
-    if (h === "copilot") {
-      const text = typeof data?.modified_output === "string" ? data.modified_output
-        : typeof data?.modified_tool_response === "string" ? data.modified_tool_response : null;
-      if (text === null) return null;
-      return { modifiedResult: { resultType: "success", textResultForLlm: text } };
-    }
+    if (!rewriteCapabilities(toolName, toolResponse, "post").includes("output_rewrite")) return null;
+    let cand = data?.modified_tool_response;
+    if (cand === undefined && typeof toolResponse === "string") cand = data?.modified_output;
+    if (cand === undefined || cand === null || !sameShape(toolResponse, cand)) return null;
+    return { hookSpecificOutput: { updatedToolOutput: cand } };
   } catch { /* fail open: original output passes through */ }
   return null;
+}
+
+// Copilot CLI result shape, kept for when its capability is verified.
+function copilotResultRewrite(data) {
+  const text = typeof data?.modified_output === "string" ? data.modified_output : null;
+  return text === null ? null : { modifiedResult: { resultType: "success", textResultForLlm: text } };
 }
 
 // The one human line for PII. The gateway's own line is printed verbatim;
@@ -1434,7 +1464,7 @@ async function handlePreToolUse() {
     // Qwen Code / Cursor (CANT_ASK) declare nothing for the same reason.
     // input_rewrite: this harness applies a rewritten tool_input (see
     // rewriteCapabilities); declared per harness and per call.
-    capabilities: [...(CANT_ASK ? [] : ["native_ask"]), ...rewriteCapabilities()],
+    capabilities: [...(CANT_ASK ? [] : ["native_ask"]), ...rewriteCapabilities(input.tool_name)],
     // Explicit attended claim (gateway parseAttended, harnessAsk.ts). Claude
     // Code only; omitted when the payload carries no permission_mode.
     ...(IS_CLAUDE_CODE && typeof input.permission_mode === "string" && input.permission_mode
@@ -1804,8 +1834,9 @@ async function handlePreToolUse() {
     // and print its line verbatim on every call (not once per class) only
     // if the claim is true. A rewrite that could not be applied is dropped.
     if (data.pii || data.modified_input !== undefined) {
-      inputRewrite = pickInputRewrite(data, input.tool_input);
-      const line = piiLine(data, inputRewrite !== null);
+      inputRewrite = pickInputRewrite(data, input.tool_name, input.tool_input);
+      let line = null;
+      try { line = piiLine(data, inputRewrite !== null); } catch { /* never an outage deny */ }
       if (line) {
         tierNotice = tierNotice === line ? tierNotice : [tierNotice, line].filter(Boolean).join(" ");
       }
@@ -2189,7 +2220,7 @@ async function handlePostToolUse() {
     tool_input: input.tool_input,
     tool_output: outputStr,
     ...(echoResponse !== undefined ? { tool_response: echoResponse } : {}),
-    capabilities: rewriteCapabilities(echoResponse),
+    capabilities: rewriteCapabilities(input.tool_name, echoResponse, "post"),
     session_id: input.session_id,
     call_id: input.tool_use_id,
     cwd: input.cwd,
@@ -2218,10 +2249,10 @@ async function handlePostToolUse() {
     // actually happened. A PII line is not a shadow notice.
     let outRewrite = null;
     if (data.pii || data.modified_tool_response !== undefined || data.modified_output !== undefined) {
-      outRewrite = echoResponse !== undefined && rewriteCapabilities(echoResponse).includes("output_rewrite")
-        ? pickOutputRewrite(data, rawResponse) : null;
+      outRewrite = echoResponse !== undefined ? pickOutputRewrite(data, input.tool_name, rawResponse) : null;
     }
-    const piiText = piiLine(data, outRewrite !== null);
+    let piiText = null;
+    try { piiText = piiLine(data, outRewrite !== null); } catch { /* fail open, silent */ }
     const isShadow = !piiText && !SHADOW_OFF && typeof data.notice === "string" && data.notice.trim() !== "";
     // notice_lever marks a "cost" lever notice (#1349/#1350 part 1:
     // expensive_run, context_threshold, tool_output_bloat, repeat_approval,
