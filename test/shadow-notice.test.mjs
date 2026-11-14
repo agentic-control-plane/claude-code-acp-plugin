@@ -115,10 +115,10 @@ test("ACP_SHADOW set to a non-off value still prints", async () => {
   assert.equal(out?.systemMessage, NOTICE);
 });
 
-test("redact keeps its existing message and never double-prints a stray notice", async () => {
+test("old-gateway redact is worded as a flag (never a removal claim) and never double-prints a stray notice", async () => {
   nextResponse = { action: "redact", reason: "redacted PII: email", notice: NOTICE };
   const out = await postHook();
-  assert.match(out.systemMessage, /^\[ACP\] Flagged: redacted PII: email/);
+  assert.match(out.systemMessage, /^\[ACP\] PII flagged: email/);
   assert.ok(!out.systemMessage.includes("[ACP shadow]"));
 });
 

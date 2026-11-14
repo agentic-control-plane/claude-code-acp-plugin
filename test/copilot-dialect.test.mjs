@@ -168,7 +168,7 @@ test("(b) an ask stays an ask under copilot, in both shapes", async () => {
   assert.equal(out.permissionDecision, "ask");
   assert.equal(out.hookSpecificOutput.permissionDecision, "ask");
   const req = seen.find((s) => s.url === "/govern/tool-use");
-  assert.deepEqual(req.body.capabilities, ["native_ask"]);
+  assert.deepEqual(req.body.capabilities, ["native_ask", "input_rewrite"]);
 });
 
 test("(c) VS Code's run_in_terminal reaches the gateway as Bash, attributed to copilot-vscode", async () => {

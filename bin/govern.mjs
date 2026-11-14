@@ -423,6 +423,128 @@ function stripControl(v) {
   return String(v ?? "").replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f‪-‮⁦-⁩]/g, " ");
 }
 
+// ── Rewrites: apply what the gateway asks for, claim only what happened ──
+// The gateway may answer with `modified_input` (PreToolUse) or
+// `modified_tool_response` / `modified_output` (PostToolUse) when policy says
+// to redact. A harness only honours the field its own hook protocol defines,
+// so a rewrite capability is declared per harness AND per tool, only where
+// the harness really applies it. Undeclared is the honest default: the
+// gateway then reports "detected", never "redacted".
+//
+//   Claude Code   in: PreToolUse updatedInput (+ allow)   out: PostToolUse updatedToolOutput
+//   qwen-code     in: updatedInput                        out: none
+//   Copilot CLI   in: modifiedArgs                        out: modifiedResult (text)
+//   Codex         none (its parser rejects updatedInput; see HARNESS note)
+//   Cursor, VS Code Copilot, others: none
+function rewriteHarness() {
+  const client = `${process.env.ACP_CLIENT ?? ""} ${process.env.ACP_HARNESS ?? ""}`;
+  if (HARNESS === "codex" || /cursor/i.test(client)) return null;
+  if (/qwen-code/i.test(client)) return "qwen";
+  if (HARNESS === "copilot") return ACP_CLIENT === "copilot-vscode" ? null : "copilot";
+  return IS_CLAUDE_CODE ? "claude" : null;
+}
+const isPlainObject = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
+
+// Capabilities for one call. `toolResponse` is the PostToolUse payload (omit
+// on PreToolUse); output_rewrite needs a response the gateway can echo back
+// in the same shape and that fit under the payload ceiling.
+function rewriteCapabilities(toolResponse) {
+  const h = rewriteHarness();
+  const caps = [];
+  if (h) caps.push("input_rewrite");
+  const echoable = toolResponse !== undefined && toolResponse !== null && (typeof toolResponse === "object" || typeof toolResponse === "string");
+  if ((h === "claude" || h === "copilot") && echoable) caps.push("output_rewrite");
+  return caps;
+}
+
+// Same top-level shape: Claude Code silently ignores an updatedToolOutput that
+// does not match the tool's output schema, so a mismatched rewrite is dropped
+// here (and nothing is claimed) rather than shipped.
+function sameShape(orig, mod) {
+  if (typeof orig === "string") return typeof mod === "string";
+  if (Array.isArray(orig)) return Array.isArray(mod);
+  if (!isPlainObject(orig) || !isPlainObject(mod)) return false;
+  const ok = Object.keys(orig), mk = Object.keys(mod);
+  if (ok.length !== mk.length || !ok.every((k) => k in mod)) return false;
+  return ok.every((k) => {
+    const a = orig[k], b = mod[k];
+    return (a === null) === (b === null) && Array.isArray(a) === Array.isArray(b) && typeof a === typeof b;
+  });
+}
+
+// Validated rewrite of tool_input, or null (not declared, malformed, throws).
+function pickInputRewrite(data, toolInput) {
+  try {
+    if (!rewriteHarness() || !isPlainObject(data?.modified_input) || !isPlainObject(toolInput)) return null;
+    const mod = data.modified_input;
+    if (typeof toolInput.command === "string" && typeof mod.command !== "string") return null;
+    return mod;
+  } catch { return null; }
+}
+
+// Harness-shaped PreToolUse output fields carrying `mod` (allow + rewrite).
+function inputRewriteOutput(mod) {
+  const hso = { hookEventName: "PreToolUse", permissionDecision: "allow" };
+  if (rewriteHarness() === "copilot") return { hookSpecificOutput: hso, modifiedArgs: mod };
+  return { hookSpecificOutput: { ...hso, updatedInput: mod } };
+}
+
+// Harness-shaped PostToolUse fields carrying the rewrite, or null.
+function pickOutputRewrite(data, toolResponse) {
+  try {
+    const h = rewriteHarness();
+    if (h === "claude") {
+      let cand = data?.modified_tool_response;
+      if (cand === undefined && typeof toolResponse === "string") cand = data?.modified_output;
+      if (cand === undefined || cand === null || !sameShape(toolResponse, cand)) return null;
+      return { hookSpecificOutput: { updatedToolOutput: cand } };
+    }
+    if (h === "copilot") {
+      const text = typeof data?.modified_output === "string" ? data.modified_output
+        : typeof data?.modified_tool_response === "string" ? data.modified_tool_response : null;
+      if (text === null) return null;
+      return { modifiedResult: { resultType: "success", textResultForLlm: text } };
+    }
+  } catch { /* fail open: original output passes through */ }
+  return null;
+}
+
+// The one human line for PII. The gateway's own line is printed verbatim;
+// but if it says "redacted" and this client did not apply a rewrite, a
+// removal claim would be false, so say only that PII was flagged.
+function piiTypesOf(data) {
+  const raw = Array.isArray(data?.pii?.types) ? data.pii.types
+    : Array.isArray(data?.types) ? data.types
+    : Array.isArray(data?.flags) ? data.flags : null;
+  if (raw) {
+    const t = raw.map((x) => stripControl(typeof x === "string" ? x : x?.type ?? x?.name ?? "")).map((s) => s.trim()).filter(Boolean);
+    if (t.length) return t.join(", ");
+  }
+  const m = /PII:?\s*([^.;]*)/i.exec(String(data?.reason ?? ""));
+  return m && m[1].trim() ? stripControl(m[1]).trim() : "";
+}
+function piiLine(data, applied) {
+  const pii = data?.pii;
+  if (isPlainObject(pii)) {
+    const claimsRemoval = pii.action === "redacted" || pii.applied === true;
+    if (claimsRemoval && !applied) {
+      const t = piiTypesOf(data);
+      return `[ACP] PII flagged${t ? `: ${t}` : ""}`;
+    }
+    const line = [data.notice, data.systemMessage, data.system_message].find((s) => typeof s === "string" && s.trim());
+    if (line) return stripControl(line).trim();
+    const t = piiTypesOf(data);
+    const verb = claimsRemoval ? "redacted" : pii.action === "blocked" ? "blocked" : "detected";
+    return `[ACP] PII ${verb}${t ? `: ${t}` : ""}`;
+  }
+  // Old gateway: flags without a pii field. Never claim removal.
+  if (data?.action === "redact" && /PII/i.test(String(data?.reason ?? "")) || (Array.isArray(data?.flags) && data.flags.length)) {
+    const t = piiTypesOf(data);
+    return `[ACP] PII flagged${t ? `: ${t}` : ""}`;
+  }
+  return null;
+}
+
 // Hostname-only form of ACP_API for env-var injection (e.g. GH_HOST).
 // gh CLI accepts hostnames, not URLs — strip protocol + trailing slash.
 const ACP_HOST = ACP_API.replace(/^https?:\/\//, "").replace(/\/$/, "");
@@ -1310,7 +1432,9 @@ async function handlePreToolUse() {
     // server-resolved tier, permission_mode, and the harness_ask rollout
     // (govern/harnessAsk.ts, server-side). Never sent on PostToolUse.
     // Qwen Code / Cursor (CANT_ASK) declare nothing for the same reason.
-    capabilities: CANT_ASK ? [] : ["native_ask"],
+    // input_rewrite: this harness applies a rewritten tool_input (see
+    // rewriteCapabilities); declared per harness and per call.
+    capabilities: [...(CANT_ASK ? [] : ["native_ask"]), ...rewriteCapabilities()],
     // Explicit attended claim (gateway parseAttended, harnessAsk.ts). Claude
     // Code only; omitted when the payload carries no permission_mode.
     ...(IS_CLAUDE_CODE && typeof input.permission_mode === "string" && input.permission_mode
@@ -1611,6 +1735,9 @@ async function handlePreToolUse() {
   // warned into the void and a fail-open was silent at the terminal.
   // Relayed every time it arrives: the server owns the frequency.
   let wireWarning = null;
+  // Validated modified_input from the gateway, applied by exitAllow and the
+  // vendor-token path; null when absent, not declared, or malformed.
+  let inputRewrite = null;
   let res;
   try {
     try {
@@ -1667,11 +1794,21 @@ async function handlePreToolUse() {
     // on whatever the policy decided. Relay each CLASS once per session so
     // the human learns about it without per-call spam, and so a tier flag
     // does not silence a later trifecta notice (#1502).
-    if (typeof data.notice === "string" && data.notice.trim() && firstNoticeOfClassThisSession(data.notice)) {
+    if (!data.pii && typeof data.notice === "string" && data.notice.trim() && firstNoticeOfClassThisSession(data.notice)) {
       tierNotice = data.notice;
     }
     if (typeof data.warning === "string" && data.warning.trim()) {
       wireWarning = data.warning.trim();
+    }
+    // PII rewrite (see pickInputRewrite): apply what the gateway asked for,
+    // and print its line verbatim on every call (not once per class) only
+    // if the claim is true. A rewrite that could not be applied is dropped.
+    if (data.pii || data.modified_input !== undefined) {
+      inputRewrite = pickInputRewrite(data, input.tool_input);
+      const line = piiLine(data, inputRewrite !== null);
+      if (line) {
+        tierNotice = tierNotice === line ? tierNotice : [tierNotice, line].filter(Boolean).join(" ");
+      }
     }
   } catch (err) {
     const reason = err && err.name === "AbortError"
@@ -1696,7 +1833,9 @@ async function handlePreToolUse() {
   }
   function exitAllow() {
     const msg = allowSystemMessage();
-    if (msg) {
+    if (inputRewrite) {
+      process.stdout.write(JSON.stringify({ ...inputRewriteOutput(inputRewrite), ...(msg ? { systemMessage: msg } : {}) }));
+    } else if (msg) {
       process.stdout.write(JSON.stringify({ systemMessage: msg }));
     }
     process.exit(0);
@@ -1705,7 +1844,7 @@ async function handlePreToolUse() {
   // Step 2 (Phase 1): if the tool matches a vendor pattern, request a
   // scoped token and inject it via updatedInput.command. The agent's
   // local PAT is never read; ACP brokers the credential.
-  const vendor = detectVendor(input.tool_name, input.tool_input);
+  const vendor = detectVendor(input.tool_name, inputRewrite ?? input.tool_input);
   if (!vendor || !policyAllowed) {
     exitAllow();
   }
@@ -1766,8 +1905,9 @@ async function handlePreToolUse() {
   // egress proxy at /api/v3/* (Phase 2). The agent's command keeps
   // working unchanged, but the call flows through ACP — credentials
   // never leave the gateway.
-  if (tokenResult.token && input.tool_input?.command) {
-    const original = String(input.tool_input.command);
+  const effectiveInput = inputRewrite ?? input.tool_input;
+  if (tokenResult.token && effectiveInput?.command) {
+    const original = String(effectiveInput.command);
     const envParts = [];
     if (vendor.hostVar && vendor.hostValue) {
       envParts.push(`${vendor.hostVar}=${vendor.hostValue}`);
@@ -1779,7 +1919,7 @@ async function handlePreToolUse() {
       hookSpecificOutput: {
         hookEventName: "PreToolUse",
         permissionDecision: "allow",
-        updatedInput: { ...input.tool_input, command: updated },
+        updatedInput: { ...effectiveInput, command: updated },
       },
       ...(msg ? { systemMessage: msg } : {}),
     }));
@@ -2038,10 +2178,18 @@ async function handlePostToolUse() {
   // for clients that never upgrade (proxy/proxySessions.ts).
   const collected = modelCallsGoThroughProxy() ? undefined : collectTranscriptUsage(input.transcript_path);
   const modelUsage = collected ? collected.turns : undefined;
+  // The structured response rides along (when it fits) so the gateway can
+  // hand back `modified_tool_response` in exactly this shape.
+  const rawResponse = input.tool_response;
+  const echoResponse = rawResponse !== undefined && rawResponse !== null
+    && Buffer.byteLength(JSON.stringify(rawResponse) ?? "", "utf8") <= POST_HOOK_PAYLOAD_CEILING
+    ? rawResponse : undefined;
   const body = JSON.stringify({
     tool_name: input.tool_name,
     tool_input: input.tool_input,
     tool_output: outputStr,
+    ...(echoResponse !== undefined ? { tool_response: echoResponse } : {}),
+    capabilities: rewriteCapabilities(echoResponse),
     session_id: input.session_id,
     call_id: input.tool_use_id,
     cwd: input.cwd,
@@ -2066,7 +2214,15 @@ async function handlePostToolUse() {
     // about it. Counted only on a real server verdict — a call the
     // gateway never saw is not claimed as governed.
     const flagged = data.action === "redact" || data.action === "block";
-    const isShadow = !SHADOW_OFF && typeof data.notice === "string" && data.notice.trim() !== "";
+    // Apply a PII rewrite first (fail open), then word the line by what
+    // actually happened. A PII line is not a shadow notice.
+    let outRewrite = null;
+    if (data.pii || data.modified_tool_response !== undefined || data.modified_output !== undefined) {
+      outRewrite = echoResponse !== undefined && rewriteCapabilities(echoResponse).includes("output_rewrite")
+        ? pickOutputRewrite(data, rawResponse) : null;
+    }
+    const piiText = piiLine(data, outRewrite !== null);
+    const isShadow = !piiText && !SHADOW_OFF && typeof data.notice === "string" && data.notice.trim() !== "";
     // notice_lever marks a "cost" lever notice (#1349/#1350 part 1:
     // expensive_run, context_threshold, tool_output_bloat, repeat_approval,
     // ...); a notice with no lever is the older shadow-mode counterfactual.
@@ -2089,7 +2245,9 @@ async function handlePostToolUse() {
     const staleNotice = staleHookNotice(res, data);
     const withStale = (msg) => (staleNotice ? `${msg} ${staleNotice}` : msg);
     const sysParts = [];
-    if (flagged) {
+    if (piiText && data.action !== "block") {
+      sysParts.push(withStale(piiText));
+    } else if (flagged) {
       sysParts.push(withStale(`[ACP] ${data.action === "block" ? "Blocked" : "Flagged"}: ${data.reason || "governance policy"}`));
     } else if (isShadow) {
       // Shadow-mode counterfactual (gatewaystack-connect#607) / lever notice
@@ -2108,9 +2266,13 @@ async function handlePostToolUse() {
       : null;
     const out = {};
     if (sysParts.length) out.systemMessage = sysParts.join(" ");
+    if (outRewrite) {
+      Object.assign(out, outRewrite);
+      if (out.hookSpecificOutput) out.hookSpecificOutput = { hookEventName: "PostToolUse", ...out.hookSpecificOutput };
+    }
     if (agentNotice) {
       if (HARNESS === "claude-code") {
-        out.hookSpecificOutput = { hookEventName: "PostToolUse", additionalContext: agentNotice };
+        out.hookSpecificOutput = { ...(out.hookSpecificOutput ?? {}), hookEventName: "PostToolUse", additionalContext: agentNotice };
       } else {
         // Codex only honors additionalContext on SessionStart; Copilot's
         // support for it here is unconfirmed. Fold into the human channel
@@ -2119,7 +2281,7 @@ async function handlePostToolUse() {
         out.systemMessage = out.systemMessage ? `${out.systemMessage} ${agentNotice}` : agentNotice;
       }
     }
-    if (out.systemMessage || out.hookSpecificOutput) process.stdout.write(JSON.stringify(out));
+    if (out.systemMessage || out.hookSpecificOutput || out.modifiedResult) process.stdout.write(JSON.stringify(out));
   } catch {
     // silent pass-through for the verdict; the usage batch is retried next
     // time (a 2xx whose body failed to parse was already acked above).
