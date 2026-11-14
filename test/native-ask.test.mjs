@@ -185,11 +185,11 @@ test("(c2) a reason the gateway already branded is not prefixed again (gsc#1372)
   assert.equal(tagged.systemMessage, "[ACP] already tagged");
 });
 
-test("(e) PostToolUse never sends a capabilities field", async () => {
+test("(e) PostToolUse never declares native_ask (rewrite capabilities only)", async () => {
   await runHook(postToolUse());
   const req = seen.find((s) => s.url === "/govern/tool-output");
   assert.ok(req, "expected a request to /govern/tool-output");
-  assert.equal(Object.prototype.hasOwnProperty.call(req.body, "capabilities"), false);
+  assert.ok(!(req.body.capabilities ?? []).includes("native_ask"));
 });
 
 // ── gatewaystack-connect#1518: honest capabilities for shared-script clients ──
@@ -221,6 +221,7 @@ for (const [label, env] of [
     await runHook(preToolUse(), env);
     const req = seen.find((s) => s.url === "/govern/tool-use");
     assert.ok(req, "expected a request to /govern/tool-use");
+    // Bash input is never rewritten, so even qwen-code declares nothing here.
     assert.deepEqual(req.body.capabilities, []);
     assert.equal(Object.prototype.hasOwnProperty.call(req.body, "attended"), false);
   });
