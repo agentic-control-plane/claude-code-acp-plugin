@@ -126,7 +126,7 @@ const ACP_GOVERN = ACP_DEV_BASE ?? resolveAcpBase(
 // hook is also installed standalone (~/.acp/govern.mjs) with no plugin.json
 // beside it. Agreement with plugin.json / marketplace.json is enforced by
 // scripts/validate-manifest.mjs and test/plugin-version.test.mjs.
-const PLUGIN_VERSION = "0.32.0";
+const PLUGIN_VERSION = "0.32.1";
 
 // Console base for user-facing deep links (session receipt, #606; enrolment
 // hint). Validated like the gateway bases: a poisoned value would otherwise
@@ -1698,11 +1698,13 @@ async function handlePreToolUse() {
   }
   function ask(reason, verdict) {
     rememberHeld(reason, "ask", verdict?.judge);
-    rememberPendingApproval(approvalMeta(verdict));
     // Codex has no ask semantic on the wire (see HARNESS note): emit deny
     // with the approval deep link so the human approves out-of-band and
     // the re-run passes under the grant.
     const decision = CANT_ASK ? "deny" : "ask";
+    // A native ask is answered in this terminal, and a "yes" runs the call
+    // right away, so it must never come back later as a retry line.
+    rememberPendingApproval(approvalMeta(verdict), { terminal: decision === "ask" });
     // Codex sees this as a hard deny, so it needs the out-of-band route
     // spelled out; Claude Code renders a prompt and the human answers it.
     const steer = decision === "deny"
@@ -2190,6 +2192,7 @@ function collectTranscriptUsage(path) {
 }
 
 async function handlePostToolUse() {
+  settlePendingForCall();
   let outputStr = "";
   try {
     const out = input.tool_response ?? input.tool_output ?? input.output;
@@ -2705,12 +2708,21 @@ function approvalMeta(verdict) {
 // both denyByPolicy and ask — coalescing on the gateway side means repeat
 // holds for the same request arrive with the same approval_id, so this
 // keeps one row per id rather than growing without bound.
-function rememberPendingApproval(meta) {
+//   toolUseId  the held call, so its PostToolUse can settle the row
+//   decidedIn  "terminal" for a native ask answered in the harness prompt,
+//              "console" for a hold decided in the console or by email.
+//              Absent on older rows: treated as "console".
+//   agentId    the subagent that made the call; absent for the main thread.
+//              The list is per session_id, which a subagent shares with
+//              its parent, so this says whose call it was.
+function rememberPendingApproval(meta, { terminal = false } = {}) {
   if (!meta) return;
   const sid = input.session_id;
   if (!sid || sid === "unknown") return;
   try {
     const list = readPending(sid).filter((e) => e && e.id !== meta.id);
+    const toolUseId = typeof input.tool_use_id === "string" && input.tool_use_id ? input.tool_use_id : null;
+    const agentId = typeof input.agent_id === "string" && input.agent_id ? input.agent_id : null;
     list.push({
       id: meta.id,
       code: meta.code,
@@ -2719,8 +2731,25 @@ function rememberPendingApproval(meta) {
       status: "pending",
       notified: false,
       at: new Date().toISOString(),
+      toolUseId,
+      decidedIn: terminal ? "terminal" : "console",
+      ...(agentId ? { agentId } : {}),
     });
     writePending(sid, list);
+  } catch { /* bookkeeping must never touch the call path */ }
+}
+
+// PostToolUse: the call has run, so any row recorded for this tool_use_id
+// is settled (a terminal ask answered yes). Dropped from the list so it is
+// neither polled, listed by /acp-approve or Stop, nor announced later.
+function settlePendingForCall() {
+  try {
+    const sid = input.session_id;
+    const id = input.tool_use_id;
+    if (!sid || sid === "unknown" || typeof id !== "string" || !id) return;
+    const list = readPending(sid);
+    const kept = list.filter((e) => !(e && e.toolUseId === id));
+    if (kept.length !== list.length) writePending(sid, kept);
   } catch { /* bookkeeping must never touch the call path */ }
 }
 
@@ -3141,16 +3170,26 @@ async function handleUserPromptSubmit() {
     const merged = mergeApprovalUpdates(list, fresh);
     const newlyApproved = merged.filter((e, i) => e.status === "approved" && list[i]?.status === "pending");
     writePending(sid, merged);
-    if (!newlyApproved.length) process.exit(0);
-    const context = newlyApproved.map((e) => `ACP-${e.code} was approved — retry the identical call now.`).join("\n");
+    // A terminal ask was answered in the prompt itself ("yes" already ran
+    // the call; "no" means do not retry): never announce it. A subagent's
+    // hold is not the main thread's call, so the parent model gets no retry
+    // line for it; the person gets an informational line instead.
+    const announce = newlyApproved.filter((e) => e.decidedIn !== "terminal");
+    const retry = announce.filter((e) => !e.agentId)
+      .map((e) => `ACP-${e.code} was approved — retry the identical call now.`);
+    const info = announce.filter((e) => e.agentId)
+      .map((e) => `ACP-${e.code}, held in a subagent, was approved.`);
+    if (!retry.length && !info.length) process.exit(0);
     // Codex only honors additionalContext on SessionStart; Copilot's
     // dialect is unconfirmed for this field outside it. Fall back to the
     // human channel on both rather than send a field the harness ignores.
-    process.stdout.write(JSON.stringify(
-      HARNESS === "claude-code"
-        ? { hookSpecificOutput: { hookEventName: "UserPromptSubmit", additionalContext: context } }
-        : { systemMessage: context },
-    ));
+    const out = HARNESS === "claude-code"
+      ? {
+          ...(retry.length ? { hookSpecificOutput: { hookEventName: "UserPromptSubmit", additionalContext: retry.join("\n") } } : {}),
+          ...(info.length ? { systemMessage: info.join("\n") } : {}),
+        }
+      : { systemMessage: [...retry, ...info].join("\n") };
+    process.stdout.write(JSON.stringify(out));
   } catch {
     // silent — an approval-status miss must never block the prompt
   }
