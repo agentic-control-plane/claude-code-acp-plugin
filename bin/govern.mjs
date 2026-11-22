@@ -508,7 +508,6 @@ function sameShape(orig, mod) {
 function pickInputRewrite(data, toolName, toolInput) {
   try {
     if (!rewriteCapabilities(toolName).includes("input_rewrite")) return null;
-    if (data?.pii?.applied === false) return null;
     if (!isPlainObject(data?.modified_input) || !isPlainObject(toolInput)) return null;
     const mod = data.modified_input;
     const a = Object.keys(toolInput).sort(), b = Object.keys(mod).sort();
@@ -2286,17 +2285,23 @@ async function handlePostToolUse() {
     const sysParts = [];
     // A PostToolUse "block" only withholds anything through the rewrite; when
     // none was applied the model got the full output, so say so.
-    const piiBlockNotApplied = data.action === "block" && outRewrite === null
-      && (isPlainObject(data.pii) || /PII/i.test(String(data.reason ?? "")));
-    if (piiText && data.action !== "block") {
-      sysParts.push(withStale(piiText));
-    } else if (piiBlockNotApplied) {
+    // A block for another reason (e.g. prompt injection) keeps its Blocked
+    // line, with the PII detail appended when PII was also found.
+    const blockNotApplied = data.action === "block" && outRewrite === null;
+    const piiReasonBlock = blockNotApplied && /PII/i.test(String(data.reason ?? ""));
+    const piiDetail = () => {
       let t = "";
       // Structured types only: parsing them out of `reason` reads badly here.
       try { if (Array.isArray(data.pii?.types) || Array.isArray(data.flags)) t = piiTypesOf(data) || ""; } catch { /* fail open */ }
-      sysParts.push(withStale(`[ACP] PII detected in tool output, not removed${t ? `: ${t}` : ""}`));
+      return `PII detected in tool output, not removed${t ? `: ${t}` : ""}`;
+    };
+    if (piiText && data.action !== "block") {
+      sysParts.push(withStale(piiText));
+    } else if (piiReasonBlock) {
+      sysParts.push(withStale(`[ACP] ${piiDetail()}`));
     } else if (flagged) {
-      sysParts.push(withStale(`[ACP] ${data.action === "block" ? "Blocked" : "Flagged"}: ${data.reason || "governance policy"}`));
+      const extra = blockNotApplied && isPlainObject(data.pii) ? ` (${piiDetail()})` : "";
+      sysParts.push(withStale(`[ACP] ${data.action === "block" ? "Blocked" : "Flagged"}: ${data.reason || "governance policy"}${extra}`));
     } else if (isShadow) {
       // Shadow-mode counterfactual (gatewaystack-connect#607) / lever notice
       // (#1349): the server sends a fully-formed human line for audit-mode
