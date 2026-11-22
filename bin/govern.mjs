@@ -126,7 +126,7 @@ const ACP_GOVERN = ACP_DEV_BASE ?? resolveAcpBase(
 // hook is also installed standalone (~/.acp/govern.mjs) with no plugin.json
 // beside it. Agreement with plugin.json / marketplace.json is enforced by
 // scripts/validate-manifest.mjs and test/plugin-version.test.mjs.
-const PLUGIN_VERSION = "0.32.0";
+const PLUGIN_VERSION = "0.33.0";
 
 // Console base for user-facing deep links (session receipt, #606; enrolment
 // hint). Validated like the gateway bases: a poisoned value would otherwise
@@ -2975,11 +2975,30 @@ function handleSessionEnd() {
 // writes to the transcript. That is fine by design: the link executes only
 // the intent the human already typed, as that human, once, inside its TTL
 // — nothing a reader of the transcript can redirect.
-const INTENT_COMMAND_RE = /(?:^|:)acp-(enforce|audit|allow|ask|deny|judge|apply|status|why|approve|notify)$/;
+const INTENT_COMMAND_RE = /(?:^|:)acp-(enforce|audit|allow|ask|deny|judge|apply|status|why|approve|notify|pii)$/;
 
 function blockExpansion(reason) {
   process.stdout.write(JSON.stringify({ decision: "block", reason }));
   process.exit(0);
+}
+
+// Gateway text printed on the human channel: control and bidi characters
+// stripped, length capped.
+const cleanGatewayText = (v) => String(v ?? "").replace(/[\u0000-\u001f\u007f-\u009f‪-‮⁦-⁩]/g, " ").slice(0, 300);
+
+// The personal data removal state from the status payload: `pii.line`, then
+// each override's text. Empty when the gateway reports no `pii` block.
+function piiStatusLines(s) {
+  const pii = s && typeof s.pii === "object" && s.pii ? s.pii : null;
+  if (!pii || typeof pii.line !== "string" || !pii.line.trim()) return [];
+  const overrides = Array.isArray(pii.overrides) ? pii.overrides : [];
+  return [
+    cleanGatewayText(pii.line),
+    ...overrides
+      .filter((o) => o && typeof o.text === "string" && o.text.trim())
+      .slice(0, 10)
+      .map((o) => `  ${cleanGatewayText(o.text)}`),
+  ];
 }
 
 async function handleUserPromptExpansion() {
@@ -3033,6 +3052,19 @@ async function handleUserPromptExpansion() {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 6000);
   try {
+    // /acp-pii status, or bare /acp-pii: read-only, nothing is filed.
+    if (kind === "pii" && (target === "" || target.toLowerCase() === "status")) {
+      const res = await fetch(`${ACP_API}/plugin/intents/status`, { method: "GET", headers, signal: controller.signal });
+      const s = await res.json().catch(() => null);
+      if (!res.ok || !s?.ok) {
+        blockExpansion(`[ACP] Couldn't read workspace status (HTTP ${res.status}). Console: ${ACP_CONSOLE}/policies`);
+      }
+      const lines = piiStatusLines(s);
+      blockExpansion(lines.length
+        ? `[ACP] ${lines.join("\n")}`
+        : `[ACP] This gateway doesn't report personal data removal yet. Console: ${ACP_CONSOLE}/policies`);
+    }
+
     if (kind === "status") {
       const res = await fetch(`${ACP_API}/plugin/intents/status`, { method: "GET", headers, signal: controller.signal });
       const s = await res.json().catch(() => null);
@@ -3069,7 +3101,9 @@ async function handleUserPromptExpansion() {
         : s.mode === "audit" && s.terminalIntents === true
           ? "/acp-enforce turns the starter rules on so they ask first."
           : "";
-      blockExpansion(`[ACP] ${s.workspace} is in ${s.mode} mode.\nInteractive rules:\n${rules}${proposals}${asks}${advice}${next ? `\n${next}` : ""}`);
+      // Personal data removal state; absent on older gateways.
+      const piiLine = piiStatusLines(s)[0];
+      blockExpansion(`[ACP] ${s.workspace} is in ${s.mode} mode.\n${piiLine ? `${piiLine}\n` : ""}Interactive rules:\n${rules}${proposals}${asks}${advice}${next ? `\n${next}` : ""}`);
     }
 
     const res = await fetch(`${ACP_API}/plugin/intents`, {
