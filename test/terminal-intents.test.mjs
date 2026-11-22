@@ -459,3 +459,91 @@ test("(n1) /acp-notify off files an intent with its target, like the rule comman
   assert.ok(post, "posts to /plugin/intents");
   assert.deepEqual({ kind: post.body.kind, target: post.body.target }, { kind: "notify", target: "off" });
 });
+
+// /acp-pii: personal data removal on or off, one tap to confirm.
+const PII_BLOCK = {
+  state: "on",
+  line: "Personal data removal is on for this workspace.",
+  overrides: [{ text: "Agent build-bot: off (override)" }, { text: "Tool WebFetch: on (override)" }],
+  overrideCount: 2,
+  command: "/acp-pii off",
+};
+const runPii = (args) => runHook(expansion({ command_name: "agentic-control-plane:acp-pii", command_args: args }));
+
+for (const target of ["on", "off"]) {
+  test(`(p1) /acp-pii ${target} posts {kind:"pii", target:"${target}"} and prints describe + confirm like the other intents`, async () => {
+    nextResponse = {
+      ok: true,
+      status: "sent",
+      to: "d***@example.com",
+      intentId: "11111111-2222-4333-8444-555555555555",
+      kind: "pii",
+      target,
+      describe: `Turn personal data removal ${target} for this workspace.`,
+      expiresInSeconds: 600,
+      confirm: "(emailed to d***@example.com — open that email and tap Confirm)",
+    };
+    const out = await runPii(target);
+    assert.equal(seen.length, 1, "exactly one request");
+    const post = seen[0];
+    assert.equal(post.method, "POST");
+    assert.equal(post.url, "/plugin/intents");
+    assert.deepEqual(post.body, { kind: "pii", target, session_id: "sess-intents-1", client: post.body.client });
+    assert.equal(out.decision, "block");
+    assert.equal(
+      out.reason,
+      `[ACP] ${nextResponse.describe}\n\nConfirm link emailed to d***@example.com — open it and tap Confirm (you, not the agent).\n` +
+      "Expires in 10 min. Nothing changes until you confirm.",
+    );
+  });
+}
+
+for (const args of ["status", ""]) {
+  test(`(p2) /acp-pii ${args || "(no argument)"} makes no POST and prints pii.line then each override`, async () => {
+    nextStatusResponse = { ...statusOf({ mode: "enforce" }), pii: PII_BLOCK };
+    const out = await runPii(args);
+    assert.ok(!seen.some((r) => r.method === "POST"), "no POST");
+    assert.equal(seen.length, 1);
+    assert.equal(seen[0].method, "GET");
+    assert.ok(seen[0].url.startsWith("/plugin/intents/status"));
+    assert.equal(out.decision, "block");
+    assert.equal(
+      out.reason,
+      "[ACP] Personal data removal is on for this workspace.\n  Agent build-bot: off (override)\n  Tool WebFetch: on (override)",
+    );
+  });
+}
+
+test("(p3) /acp-pii maybe prints the gateway's hint and makes at most one request", async () => {
+  nextStatus = 400;
+  nextResponse = { error: "setting-required", hint: "Use /acp-pii on or /acp-pii off." };
+  const out = await runPii("maybe");
+  assert.ok(seen.length <= 1, "at most one request");
+  assert.equal(out.decision, "block");
+  assert.ok(out.reason.includes("Use /acp-pii on or /acp-pii off."), out.reason);
+});
+
+test("(p4) /acp-status prints pii.line when the payload has a pii block, unchanged without one (older gateway)", async () => {
+  nextStatusResponse = statusOf({ mode: "audit" });
+  const older = await runStatus();
+  assert.ok(!older.reason.includes("Personal data"));
+
+  nextStatusResponse = { ...statusOf({ mode: "audit" }), pii: PII_BLOCK };
+  const withPii = await runStatus();
+  assert.ok(withPii.reason.includes(PII_BLOCK.line));
+  assert.ok(!withPii.reason.includes("build-bot"), "/acp-status prints only the line");
+  assert.equal(withPii.reason.replace(`${PII_BLOCK.line}\n`, ""), older.reason, "nothing else changes");
+});
+
+test("(p5) every /acp-pii form blocks the expansion so the model never sees it", async () => {
+  nextStatusResponse = { ...statusOf({ mode: "audit" }), pii: PII_BLOCK };
+  for (const args of ["on", "off", "status", "", "maybe"]) {
+    const out = await runPii(args);
+    assert.equal(out?.decision, "block", `blocked for "${args}"`);
+  }
+  // Even when the gateway is too old to report the state.
+  nextStatusResponse = statusOf({ mode: "audit" });
+  const old = await runPii("status");
+  assert.equal(old.decision, "block");
+  assert.match(old.reason, /doesn't report personal data removal/);
+});
