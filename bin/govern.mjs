@@ -125,8 +125,7 @@ const ACP_GOVERN = ACP_DEV_BASE ?? resolveAcpBase(
 // Must stay a literal: install.sh greps the PLUGIN_VERSION literal line and the
 // hook is also installed standalone (~/.acp/govern.mjs) with no plugin.json
 // beside it. Agreement with plugin.json / marketplace.json is enforced by
-// scripts/validate-manifest.mjs and test/plugin-version.test.mjs
-// (gatewaystack-connect#1538 item 6).
+// scripts/validate-manifest.mjs and test/plugin-version.test.mjs.
 const PLUGIN_VERSION = "0.32.0";
 
 // Console base for user-facing deep links (session receipt, #606; enrolment
@@ -509,6 +508,7 @@ function sameShape(orig, mod) {
 function pickInputRewrite(data, toolName, toolInput) {
   try {
     if (!rewriteCapabilities(toolName).includes("input_rewrite")) return null;
+    if (data?.pii?.applied === false) return null;
     if (!isPlainObject(data?.modified_input) || !isPlainObject(toolInput)) return null;
     const mod = data.modified_input;
     const a = Object.keys(toolInput).sort(), b = Object.keys(mod).sort();
@@ -530,6 +530,9 @@ function inputRewriteOutput(mod) {
 function pickOutputRewrite(data, toolName, toolResponse) {
   try {
     if (!rewriteCapabilities(toolName, toolResponse, "post").includes("output_rewrite")) return null;
+    // The gateway's own re-check rejected its rewrite: apply nothing, even
+    // if a modified_output string came back with the reply.
+    if (data?.pii?.applied === false) return null;
     let cand = data?.modified_tool_response;
     if (cand === undefined && typeof toolResponse === "string") cand = data?.modified_output;
     if (cand === undefined || cand === null || !sameShape(toolResponse, cand)) return null;
@@ -2281,8 +2284,17 @@ async function handlePostToolUse() {
     const staleNotice = staleHookNotice(res, data);
     const withStale = (msg) => (staleNotice ? `${msg} ${staleNotice}` : msg);
     const sysParts = [];
+    // A PostToolUse "block" only withholds anything through the rewrite; when
+    // none was applied the model got the full output, so say so.
+    const piiBlockNotApplied = data.action === "block" && outRewrite === null
+      && (isPlainObject(data.pii) || /PII/i.test(String(data.reason ?? "")));
     if (piiText && data.action !== "block") {
       sysParts.push(withStale(piiText));
+    } else if (piiBlockNotApplied) {
+      let t = "";
+      // Structured types only: parsing them out of `reason` reads badly here.
+      try { if (Array.isArray(data.pii?.types) || Array.isArray(data.flags)) t = piiTypesOf(data) || ""; } catch { /* fail open */ }
+      sysParts.push(withStale(`[ACP] PII detected in tool output, not removed${t ? `: ${t}` : ""}`));
     } else if (flagged) {
       sysParts.push(withStale(`[ACP] ${data.action === "block" ? "Blocked" : "Flagged"}: ${data.reason || "governance policy"}`));
     } else if (isShadow) {

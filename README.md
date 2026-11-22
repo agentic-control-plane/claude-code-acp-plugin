@@ -66,7 +66,11 @@ Plain `claude` sends model calls straight to Anthropic, so the hook never sees t
 
 ### Plain-launch notice (v0.19.0+)
 
-The hook sees every tool call whether you start `claude` or `claude-acp`, and prices model calls from the transcript either way. Under plain `claude` it cannot policy-check the model calls themselves. Only `claude-acp` (`~/.acp/bin/claude-acp`, written by the installer) routes them through the ACP proxy, where tool-result redaction and model routing run and where cost is metered rather than estimated. Under plain `claude`, the first allowed call of each session says so, once:
+The hook sees every tool call whether you start `claude` or `claude-acp`, and prices model calls from the transcript either way. Under plain `claude` it cannot policy-check the model calls themselves. Only `claude-acp` (`~/.acp/bin/claude-acp`, written by the installer) routes them through the ACP proxy, where model routing runs, where redaction applies to every tool result in the model request, and where cost is metered rather than estimated.
+
+Under either launch, the hook itself can remove personal data from some tool results before the model sees them. This works on Claude Code only, when the workspace has PII redaction on, for response shapes tested against real Claude Code: Bash output, Read of a text file, MCP text content, and (v0.32.0+) WebFetch and WebSearch results. The hook applies the gateway's rewrite only when its shape matches the original exactly and the gateway reports it applied. Otherwise the original output passes through and the terminal line says the data was detected, not removed. Other tool results (Grep, Glob, images, PDFs, subagent output) are not rewritten by the hook; under plain `claude` they reach the model unchanged.
+
+Under plain `claude`, the first allowed call of each session says model calls are not policy-checked, once. Its "tool-result redaction" means the proxy's redaction of the model request, not the hook's rewrite above:
 
 ```
 [ACP] Tool calls in this session are checked and logged, and model-call cost is estimated from the session transcript (API-rate equivalent, not a metered charge). Model calls are not policy-checked: plain `claude` sends them straight to the provider, so tool-result redaction and model routing are off. For those, launch with `claude-acp` (~/.acp/bin/claude-acp). Shown once per session.

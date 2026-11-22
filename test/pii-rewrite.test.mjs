@@ -301,6 +301,78 @@ test("WebFetch / WebSearch: input rewrite is unchanged by the output declaration
   }
 });
 
+// -- gateway re-check rejected its own rewrite (pii.applied:false) -----------
+
+const REJECTED_PII = { types: ["email"], count: 1, action: "detected", applied: false };
+const DETECTED = "[ACP] PII detected: email";
+
+test("rejected re-check: modified_output is never applied (WebFetch, WebSearch, string MCP)", async () => {
+  const cases = [
+    ["WebFetch", FETCH_RESP, JSON.stringify(FETCH_MOD)],
+    ["WebSearch", SEARCH_RESP, JSON.stringify(SEARCH_MOD)],
+    ["mcp__crm__get", `mail ${ADDR}`, "mail [REDACTED:email]"],
+  ];
+  for (const [tool, toolResponse, modified_output] of cases) {
+    for (const notice of [DETECTED, undefined]) {
+      const reply = { action: "redact", reason: "redacted PII: email", pii: REJECTED_PII, modified_output, ...(notice ? { notice } : {}) };
+      const { out, body } = await run("PostToolUse", "claude", reply, { tool, toolResponse });
+      assert.deepEqual(body.capabilities, ["output_rewrite"], tool);
+      assert.equal(out.hookSpecificOutput, undefined, `${tool} applied a rejected rewrite`);
+      assert.equal(out.systemMessage, DETECTED, tool);
+      assert.ok(!/redacted|removed/i.test(out.systemMessage), tool);
+    }
+  }
+});
+
+test("rejected re-check: a same-shape modified_tool_response is not applied either", async () => {
+  const reply = { action: "redact", pii: REJECTED_PII, notice: DETECTED, modified_tool_response: FETCH_MOD };
+  const { out } = await run("PostToolUse", "claude", reply, { tool: "WebFetch", toolResponse: FETCH_RESP });
+  assert.equal(out.hookSpecificOutput, undefined);
+  assert.equal(out.systemMessage, DETECTED);
+});
+
+test("input rewrite: applied for WebFetch / WebSearch / MCP, skipped when the gateway says applied:false", async () => {
+  const cases = [
+    ["WebFetch", { url: `https://x.dev/?q=${ADDR}`, prompt: "summarise" }, { url: "https://x.dev/?q=[REDACTED:email]", prompt: "summarise" }],
+    ["WebSearch", { query: `who is ${ADDR}` }, { query: "who is [REDACTED:email]" }],
+    [MCP, MCP_IN, MCP_MOD_IN],
+  ];
+  for (const [tool, toolInput, mod] of cases) {
+    const ok = await run("PreToolUse", "claude", pre({ modified_input: mod }), { tool, toolInput });
+    assert.deepEqual(ok.out.hookSpecificOutput, { hookEventName: "PreToolUse", updatedInput: mod }, tool);
+    assert.equal(ok.out.systemMessage, PII_LINE, tool);
+    const rej = await run("PreToolUse", "claude", { decision: "allow", pii: REJECTED_PII, notice: DETECTED, modified_input: mod }, { tool, toolInput });
+    assert.equal(rej.out.hookSpecificOutput, undefined, `${tool} applied a rejected input rewrite`);
+    assert.equal(rej.out.systemMessage, DETECTED, tool);
+  }
+});
+
+// -- block mode: honest line when nothing was withheld -----------------------
+
+test("PII block with no rewrite applied: says detected, not removed, never 'Blocked'", async () => {
+  const replies = [
+    { action: "block", reason: "PII detected in tool output (email)", pii: { types: ["email"], count: 1, action: "blocked", applied: false } },
+    { action: "block", reason: "PII detected in tool output (email)", pii: { types: ["email"], count: 1, action: "blocked", applied: true } },
+  ];
+  for (const reply of replies) {
+    const { out } = await run("PostToolUse", "claude", reply, { tool: "WebFetch", toolResponse: FETCH_RESP });
+    assert.equal(out.hookSpecificOutput, undefined, JSON.stringify(reply));
+    assert.equal(out.systemMessage, "[ACP] PII detected in tool output, not removed: email", JSON.stringify(reply));
+  }
+  // Old gateway: no pii field, types only in the reason text.
+  const { out } = await run("PostToolUse", "claude", { action: "block", reason: "PII detected in tool output (email)" }, { tool: "WebFetch", toolResponse: FETCH_RESP });
+  assert.equal(out.hookSpecificOutput, undefined);
+  assert.equal(out.systemMessage, "[ACP] PII detected in tool output, not removed");
+});
+
+test("PII block with the withheld rewrite applied keeps the Blocked line", async () => {
+  const withheld = { ...FETCH_RESP, codeText: "withheld", result: "withheld", url: "withheld" };
+  const reply = { action: "block", reason: "PII detected in tool output (email)", modified_tool_response: withheld, pii: { types: ["email"], count: 1, action: "blocked", applied: true } };
+  const { out } = await run("PostToolUse", "claude", reply, { tool: "WebFetch", toolResponse: FETCH_RESP });
+  assert.deepEqual(out.hookSpecificOutput, { hookEventName: "PostToolUse", updatedToolOutput: withheld });
+  assert.match(out.systemMessage, /^\[ACP\] Blocked: PII detected in tool output/);
+});
+
 test("Copilot (unverified), Codex, qwen, Cursor, VS Code: no output rewrite", async () => {
   for (const h of ["copilot", "codex", "qwen", "cursor", "vscode"]) {
     const { out } = await run("PostToolUse", h, POST_RESP);
