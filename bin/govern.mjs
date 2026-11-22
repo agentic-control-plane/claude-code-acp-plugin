@@ -125,9 +125,8 @@ const ACP_GOVERN = ACP_DEV_BASE ?? resolveAcpBase(
 // Must stay a literal: install.sh greps the PLUGIN_VERSION literal line and the
 // hook is also installed standalone (~/.acp/govern.mjs) with no plugin.json
 // beside it. Agreement with plugin.json / marketplace.json is enforced by
-// scripts/validate-manifest.mjs and test/plugin-version.test.mjs
-// (gatewaystack-connect#1538 item 6).
-const PLUGIN_VERSION = "0.31.0";
+// scripts/validate-manifest.mjs and test/plugin-version.test.mjs.
+const PLUGIN_VERSION = "0.32.0";
 
 // Console base for user-facing deep links (session receipt, #606; enrolment
 // hint). Validated like the gateway bases: a poisoned value would otherwise
@@ -460,12 +459,17 @@ const inputRewriteTool = (name) => typeof name === "string" && (/^mcp__/.test(na
 
 // Output rewrite only for response shapes proven against real Claude Code:
 // Bash {stdout,...}, Read of a text file, MCP text content (string, or an
-// array of text blocks). Images, PDF/notebook Read, Grep/Glob, WebFetch and
-// Agent are not declared until proven.
+// array of text blocks), WebFetch {result,url,...} and WebSearch
+// {query,results,...} (probed 2026-11-21 on Claude Code 2.1.330; the fetch
+// runs in the web-fetch subagent and the rewrite holds there; WebSearch
+// `results` mixes objects and plain strings, which sameShape handles).
+// Images, PDF/notebook Read, Grep/Glob and Agent are not declared until proven.
 function outputRewriteProven(name, r) {
   if (typeof name !== "string") return false;
   if (name === "Bash") return isPlainObject(r) && typeof r.stdout === "string";
   if (name === "Read") return isPlainObject(r) && r.type === "text" && isPlainObject(r.file) && typeof r.file.content === "string";
+  if (name === "WebFetch") return isPlainObject(r) && typeof r.result === "string" && typeof r.url === "string";
+  if (name === "WebSearch") return isPlainObject(r) && Array.isArray(r.results);
   if (/^mcp__/.test(name)) {
     return typeof r === "string" || (Array.isArray(r) && r.length > 0 && r.every((b) => isPlainObject(b) && b.type === "text" && typeof b.text === "string"));
   }
@@ -504,6 +508,7 @@ function sameShape(orig, mod) {
 function pickInputRewrite(data, toolName, toolInput) {
   try {
     if (!rewriteCapabilities(toolName).includes("input_rewrite")) return null;
+    if (data?.pii?.applied === false) return null;
     if (!isPlainObject(data?.modified_input) || !isPlainObject(toolInput)) return null;
     const mod = data.modified_input;
     const a = Object.keys(toolInput).sort(), b = Object.keys(mod).sort();
@@ -525,6 +530,9 @@ function inputRewriteOutput(mod) {
 function pickOutputRewrite(data, toolName, toolResponse) {
   try {
     if (!rewriteCapabilities(toolName, toolResponse, "post").includes("output_rewrite")) return null;
+    // The gateway's own re-check rejected its rewrite: apply nothing, even
+    // if a modified_output string came back with the reply.
+    if (data?.pii?.applied === false) return null;
     let cand = data?.modified_tool_response;
     if (cand === undefined && typeof toolResponse === "string") cand = data?.modified_output;
     if (cand === undefined || cand === null || !sameShape(toolResponse, cand)) return null;
@@ -2276,8 +2284,17 @@ async function handlePostToolUse() {
     const staleNotice = staleHookNotice(res, data);
     const withStale = (msg) => (staleNotice ? `${msg} ${staleNotice}` : msg);
     const sysParts = [];
+    // A PostToolUse "block" only withholds anything through the rewrite; when
+    // none was applied the model got the full output, so say so.
+    const piiBlockNotApplied = data.action === "block" && outRewrite === null
+      && (isPlainObject(data.pii) || /PII/i.test(String(data.reason ?? "")));
     if (piiText && data.action !== "block") {
       sysParts.push(withStale(piiText));
+    } else if (piiBlockNotApplied) {
+      let t = "";
+      // Structured types only: parsing them out of `reason` reads badly here.
+      try { if (Array.isArray(data.pii?.types) || Array.isArray(data.flags)) t = piiTypesOf(data) || ""; } catch { /* fail open */ }
+      sysParts.push(withStale(`[ACP] PII detected in tool output, not removed${t ? `: ${t}` : ""}`));
     } else if (flagged) {
       sysParts.push(withStale(`[ACP] ${data.action === "block" ? "Blocked" : "Flagged"}: ${data.reason || "governance policy"}`));
     } else if (isShadow) {
