@@ -228,6 +228,79 @@ test("MCP text content and plain string responses are applied in shape", async (
   assert.equal(b.out.hookSpecificOutput.updatedToolOutput, "mail [REDACTED:email]");
 });
 
+// -- WebFetch / WebSearch: shapes captured from a real Claude Code run -------
+
+const FETCH_RESP = { bytes: 120, code: 200, codeText: "OK", result: `Contact ${ADDR}`, durationMs: 40, url: "https://x.dev" };
+const FETCH_MOD = { ...FETCH_RESP, result: "Contact [REDACTED:email]" };
+const SEARCH_RESP = { query: "jane", results: [{ tool_use_id: "srv_1", content: [{ title: `Jane ${ADDR}`, url: "https://x.dev" }] }, `Summary: ${ADDR}`], durationSeconds: 1.2, searchCount: 1 };
+const SEARCH_MOD = { ...SEARCH_RESP, results: [{ tool_use_id: "srv_1", content: [{ title: "Jane [REDACTED:email]", url: "https://x.dev" }] }, "Summary: [REDACTED:email]"] };
+
+test("WebFetch / WebSearch: output_rewrite declared on Claude Code only, for the proven shapes only", async () => {
+  for (const [tool, toolResponse] of [["WebFetch", FETCH_RESP], ["WebSearch", SEARCH_RESP], ["WebSearch", { results: [] }]]) {
+    const { body } = await run("PostToolUse", "claude", { action: "pass" }, { tool, toolResponse });
+    assert.deepEqual(body.capabilities, ["output_rewrite"], tool);
+    assert.deepEqual(body.tool_response, toolResponse, tool);
+    for (const h of ["qwen", "codex", "cursor", "copilot", "vscode"]) {
+      const r = await run("PostToolUse", h, { action: "pass" }, { tool, toolResponse });
+      assert.deepEqual(r.body.capabilities, [], `${tool} ${h}`);
+    }
+  }
+  const no = [["WebFetch", `Contact ${ADDR}`], ["WebFetch", { ...FETCH_RESP, result: 5 }], ["WebFetch", [FETCH_RESP]], ["WebFetch", { url: "https://x.dev" }],
+    ["WebSearch", `Jane ${ADDR}`], ["WebSearch", { ...SEARCH_RESP, results: "x" }], ["WebSearch", [SEARCH_RESP]], ["WebSearch", { query: "jane" }]];
+  for (const [tool, toolResponse] of no) {
+    const { body } = await run("PostToolUse", "claude", { action: "pass" }, { tool, toolResponse });
+    assert.deepEqual(body.capabilities, [], `${tool} ${JSON.stringify(toolResponse)}`);
+  }
+});
+
+test("WebFetch / WebSearch: oversize response is not sent and output_rewrite not declared", async () => {
+  const bigFetch = { ...FETCH_RESP, result: "x".repeat(300 * 1024) };
+  const bigSearch = { ...SEARCH_RESP, results: ["x".repeat(300 * 1024)] };
+  for (const [tool, toolResponse] of [["WebFetch", bigFetch], ["WebSearch", bigSearch]]) {
+    const { body } = await run("PostToolUse", "claude", { action: "pass" }, { tool, toolResponse });
+    assert.equal(body.tool_response, undefined, tool);
+    assert.deepEqual(body.capabilities, [], tool);
+  }
+});
+
+test("WebFetch / WebSearch: a same-shape rewrite becomes updatedToolOutput and removal is claimed", async () => {
+  for (const [tool, toolResponse, mod] of [["WebFetch", FETCH_RESP, FETCH_MOD], ["WebSearch", SEARCH_RESP, SEARCH_MOD]]) {
+    const { out } = await run("PostToolUse", "claude", { ...POST_RESP, modified_tool_response: mod }, { tool, toolResponse });
+    assert.deepEqual(out.hookSpecificOutput, { hookEventName: "PostToolUse", updatedToolOutput: mod }, tool);
+    assert.equal(out.systemMessage, PII_LINE, tool);
+    assert.ok(!JSON.stringify(out).includes(ADDR), tool);
+  }
+});
+
+test("WebFetch / WebSearch: a different-shape rewrite is dropped and removal is not claimed", async () => {
+  const fetchBad = [{ result: "Contact [REDACTED:email]" }, "Contact [REDACTED:email]", { ...FETCH_MOD, code: "200" }, { ...FETCH_MOD, extra: 1 }];
+  const searchBad = [
+    { ...SEARCH_MOD, results: [SEARCH_MOD.results[0]] },
+    { ...SEARCH_MOD, results: [SEARCH_MOD.results[1], SEARCH_MOD.results[0]] },
+    { ...SEARCH_MOD, results: [{ tool_use_id: "srv_1", content: [{ title: "Jane" }] }, "Summary"] },
+    { ...SEARCH_MOD, results: [{ tool_use_id: "srv_1", content: [{ title: "Jane", url: "https://x.dev" }] }, { text: "Summary" }] },
+    { results: SEARCH_MOD.results },
+  ];
+  for (const [tool, toolResponse, bads] of [["WebFetch", FETCH_RESP, fetchBad], ["WebSearch", SEARCH_RESP, searchBad]]) {
+    for (const bad of bads) {
+      const { out } = await run("PostToolUse", "claude", { ...POST_RESP, modified_tool_response: bad }, { tool, toolResponse });
+      assert.equal(out.hookSpecificOutput, undefined, `${tool} ${JSON.stringify(bad)}`);
+      assert.equal(out.systemMessage, NEUTRAL, tool);
+    }
+  }
+});
+
+test("WebFetch / WebSearch: input rewrite is unchanged by the output declaration", async () => {
+  for (const tool of ["WebFetch", "WebSearch"]) {
+    const toolInput = { url: `https://x.dev/?q=${ADDR}`, prompt: "summarise" };
+    const mod = { url: "https://x.dev/?q=[REDACTED:email]", prompt: "summarise" };
+    const { out, body } = await run("PreToolUse", "claude", pre({ modified_input: mod }), { tool, toolInput });
+    assert.ok(body.capabilities.includes("input_rewrite"), tool);
+    assert.ok(!body.capabilities.includes("output_rewrite"), tool);
+    assert.deepEqual(out.hookSpecificOutput.updatedInput, mod, tool);
+  }
+});
+
 test("Copilot (unverified), Codex, qwen, Cursor, VS Code: no output rewrite", async () => {
   for (const h of ["copilot", "codex", "qwen", "cursor", "vscode"]) {
     const { out } = await run("PostToolUse", h, POST_RESP);

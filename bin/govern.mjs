@@ -127,7 +127,7 @@ const ACP_GOVERN = ACP_DEV_BASE ?? resolveAcpBase(
 // beside it. Agreement with plugin.json / marketplace.json is enforced by
 // scripts/validate-manifest.mjs and test/plugin-version.test.mjs
 // (gatewaystack-connect#1538 item 6).
-const PLUGIN_VERSION = "0.31.0";
+const PLUGIN_VERSION = "0.32.0";
 
 // Console base for user-facing deep links (session receipt, #606; enrolment
 // hint). Validated like the gateway bases: a poisoned value would otherwise
@@ -460,12 +460,17 @@ const inputRewriteTool = (name) => typeof name === "string" && (/^mcp__/.test(na
 
 // Output rewrite only for response shapes proven against real Claude Code:
 // Bash {stdout,...}, Read of a text file, MCP text content (string, or an
-// array of text blocks). Images, PDF/notebook Read, Grep/Glob, WebFetch and
-// Agent are not declared until proven.
+// array of text blocks), WebFetch {result,url,...} and WebSearch
+// {query,results,...} (probed 2026-11-21 on Claude Code 2.1.330; the fetch
+// runs in the web-fetch subagent and the rewrite holds there; WebSearch
+// `results` mixes objects and plain strings, which sameShape handles).
+// Images, PDF/notebook Read, Grep/Glob and Agent are not declared until proven.
 function outputRewriteProven(name, r) {
   if (typeof name !== "string") return false;
   if (name === "Bash") return isPlainObject(r) && typeof r.stdout === "string";
   if (name === "Read") return isPlainObject(r) && r.type === "text" && isPlainObject(r.file) && typeof r.file.content === "string";
+  if (name === "WebFetch") return isPlainObject(r) && typeof r.result === "string" && typeof r.url === "string";
+  if (name === "WebSearch") return isPlainObject(r) && Array.isArray(r.results);
   if (/^mcp__/.test(name)) {
     return typeof r === "string" || (Array.isArray(r) && r.length > 0 && r.every((b) => isPlainObject(b) && b.type === "text" && typeof b.text === "string"));
   }
