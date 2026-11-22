@@ -15,7 +15,7 @@
 import { test, before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
@@ -114,15 +114,22 @@ const expansion = (sid, overrides = {}) => ({
 });
 
 const APPROVAL_ID = "5f00abcd-0000-4000-8000-000000000000";
-async function holdOneCall(sid) {
+// decision "deny" = held for a console/email decision (the deny-and-wait
+// path); "ask" = a native ask answered in the terminal under Claude Code.
+async function holdOneCall(sid, { decision = "deny", overrides = {}, env = {} } = {}) {
   nextToolUse = {
-    decision: "ask", reason: "approval required", kind: "delegate",
+    decision, reason: decision === "deny"
+      ? `approval-requested:${APPROVAL_ID} — call acp_wait_approval with approval_id ${APPROVAL_ID}`
+      : "approval required",
+    kind: "delegate",
     approval_id: APPROVAL_ID, approval_code: "5F00",
     approval_url: `https://cloud.agenticcontrolplane.com/approvals?id=${APPROVAL_ID}`,
     approval_summary: "Bash · rm -rf build/",
   };
-  await runHook(preToolUse(sid));
+  return runHook(preToolUse(sid, overrides), env);
 }
+const approvedNow = () => ({ approvals: [{ id: APPROVAL_ID, code: "5F00", status: "approved", summary: "x", created_at: new Date().toISOString() }] });
+const pendingFile = (sid) => join(HOME, ".acp", "session-stats", `${sid}.pending.json`);
 
 test("UserPromptSubmit polls approvals for pending ids and stays silent when nothing changed", async () => {
   const sid = "sess-poll-nochange";
@@ -156,6 +163,80 @@ test("UserPromptSubmit under Codex/Copilot also writes the retry line to systemM
   const out = await runHook(promptSubmit(sid), { ACP_HARNESS: "codex" });
   assert.equal(out.hookSpecificOutput, undefined);
   assert.match(out.systemMessage, /ACP-5F00 was approved/);
+});
+
+test("a terminal ask answered yes and run never comes back as a retry line", async () => {
+  const sid = "sess-terminal-ran";
+  const pre = await holdOneCall(sid, { decision: "ask", overrides: { tool_use_id: "toolu_term_1" } });
+  assert.equal(pre.hookSpecificOutput.permissionDecision, "ask");
+  // The person said yes in the harness prompt; the call ran.
+  await runHook({ hook_event_name: "PostToolUse", tool_name: "Bash", tool_input: { command: "rm -rf build/" }, tool_response: "ok", session_id: sid, tool_use_id: "toolu_term_1" });
+  assert.deepEqual(JSON.parse(readFileSync(pendingFile(sid), "utf8")), [], "the settled row is dropped");
+  seen = [];
+  nextApprovals = approvedNow();
+  const out = await runHook(promptSubmit(sid));
+  assert.equal(out, null);
+  assert.equal(seen.length, 0, "nothing left to poll");
+});
+
+test("a terminal ask never produces a retry line even if the row is still pending (answered no, or no PostToolUse)", async () => {
+  const sid = "sess-terminal-no";
+  await holdOneCall(sid, { decision: "ask", overrides: { tool_use_id: "toolu_term_2" } });
+  nextApprovals = approvedNow();
+  const out = await runHook(promptSubmit(sid));
+  assert.equal(out, null);
+  const row = JSON.parse(readFileSync(pendingFile(sid), "utf8"))[0];
+  assert.equal(row.status, "approved", "the status is still merged so the row leaves the pending list");
+});
+
+test("a console hold approved later produces exactly one retry line", async () => {
+  const sid = "sess-console-once";
+  const pre = await holdOneCall(sid, { overrides: { tool_use_id: "toolu_console_1" } });
+  assert.equal(pre.hookSpecificOutput.permissionDecision, "deny");
+  const row = JSON.parse(readFileSync(pendingFile(sid), "utf8"))[0];
+  assert.equal(row.decidedIn, "console");
+  assert.equal(row.toolUseId, "toolu_console_1");
+  assert.equal(row.agentId, undefined, "main thread rows carry no owner");
+  nextApprovals = approvedNow();
+  const out = await runHook(promptSubmit(sid));
+  const lines = out.hookSpecificOutput.additionalContext.split("\n");
+  assert.deepEqual(lines, ["ACP-5F00 was approved — retry the identical call now."]);
+  assert.equal(out.systemMessage, undefined);
+  assert.equal(await runHook(promptSubmit(sid)), null, "never twice");
+});
+
+test("a subagent's approved hold gives the parent model nothing, the person an informational line", async () => {
+  const sid = "sess-subagent-owned";
+  await holdOneCall(sid, { overrides: { tool_use_id: "toolu_sub_1", agent_id: "agent-sub-1" } });
+  assert.equal(JSON.parse(readFileSync(pendingFile(sid), "utf8"))[0].agentId, "agent-sub-1");
+  nextApprovals = approvedNow();
+  const out = await runHook(promptSubmit(sid));
+  assert.equal(out.hookSpecificOutput, undefined, "no additionalContext for the parent");
+  assert.equal(out.systemMessage, "ACP-5F00, held in a subagent, was approved.");
+  assert.equal(await runHook(promptSubmit(sid)), null, "never twice");
+});
+
+test("a subagent's approved hold under Codex is the informational line only", async () => {
+  const sid = "sess-subagent-codex";
+  await holdOneCall(sid, { overrides: { agent_id: "agent-sub-2" }, env: { ACP_HARNESS: "codex" } });
+  nextApprovals = approvedNow();
+  const out = await runHook(promptSubmit(sid), { ACP_HARNESS: "codex" });
+  assert.equal(out.hookSpecificOutput, undefined);
+  assert.equal(out.systemMessage, "ACP-5F00, held in a subagent, was approved.");
+});
+
+test("a legacy row without the new fields behaves as a main-thread console hold", async () => {
+  const sid = "sess-legacy-row";
+  mkdirSync(join(HOME, ".acp", "session-stats"), { recursive: true });
+  writeFileSync(pendingFile(sid), JSON.stringify([{
+    id: APPROVAL_ID, code: "5F00", url: null, summary: "Bash · rm -rf build/",
+    status: "pending", notified: false, at: new Date().toISOString(),
+  }]));
+  // An unrelated PostToolUse must not drop a row it cannot match.
+  await runHook({ hook_event_name: "PostToolUse", tool_name: "Read", tool_input: {}, tool_response: "x", session_id: sid, tool_use_id: "toolu_other" });
+  nextApprovals = approvedNow();
+  const out = await runHook(promptSubmit(sid));
+  assert.match(out.hookSpecificOutput.additionalContext, /^ACP-5F00 was approved — retry the identical call now\.$/);
 });
 
 test("UserPromptSubmit with no pending calls makes no network request", async () => {
