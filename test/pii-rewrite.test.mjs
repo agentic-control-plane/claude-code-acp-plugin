@@ -331,7 +331,7 @@ test("rejected re-check: a same-shape modified_tool_response is not applied eith
   assert.equal(out.systemMessage, DETECTED);
 });
 
-test("input rewrite: applied for WebFetch / WebSearch / MCP, skipped when the gateway says applied:false", async () => {
+test("input rewrite: applied for WebFetch / WebSearch / MCP, including a policy transform with pii applied:false", async () => {
   const cases = [
     ["WebFetch", { url: `https://x.dev/?q=${ADDR}`, prompt: "summarise" }, { url: "https://x.dev/?q=[REDACTED:email]", prompt: "summarise" }],
     ["WebSearch", { query: `who is ${ADDR}` }, { query: "who is [REDACTED:email]" }],
@@ -341,10 +341,18 @@ test("input rewrite: applied for WebFetch / WebSearch / MCP, skipped when the ga
     const ok = await run("PreToolUse", "claude", pre({ modified_input: mod }), { tool, toolInput });
     assert.deepEqual(ok.out.hookSpecificOutput, { hookEventName: "PreToolUse", updatedInput: mod }, tool);
     assert.equal(ok.out.systemMessage, PII_LINE, tool);
-    const rej = await run("PreToolUse", "claude", { decision: "allow", pii: REJECTED_PII, notice: DETECTED, modified_input: mod }, { tool, toolInput });
-    assert.equal(rej.out.hookSpecificOutput, undefined, `${tool} applied a rejected input rewrite`);
-    assert.equal(rej.out.systemMessage, DETECTED, tool);
+    // A policy `modify` transform (e.g. redact_pii) can arrive next to a PII
+    // field that says detected/applied:false; the transform still applies.
+    const pol = await run("PreToolUse", "claude", { decision: "allow", pii: REJECTED_PII, notice: DETECTED, modified_input: mod }, { tool, toolInput });
+    assert.deepEqual(pol.out.hookSpecificOutput, { hookEventName: "PreToolUse", updatedInput: mod }, `${tool} dropped a policy transform`);
   }
+});
+
+test("prompt-injection block with PII also present keeps the Blocked line and appends the PII detail", async () => {
+  const reply = { action: "block", reason: "prompt-injection detected", pii: { types: ["email"], count: 1, action: "detected", applied: false } };
+  const { out } = await run("PostToolUse", "claude", reply, { tool: "WebFetch", toolResponse: FETCH_RESP });
+  assert.equal(out.hookSpecificOutput, undefined);
+  assert.equal(out.systemMessage, "[ACP] Blocked: prompt-injection detected (PII detected in tool output, not removed: email)");
 });
 
 // -- block mode: honest line when nothing was withheld -----------------------
