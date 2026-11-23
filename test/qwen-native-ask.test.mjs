@@ -278,6 +278,22 @@ test("(c) ACP_HARNESS=qwen-code: claim true asks, claim false denies", async () 
   assert.ok((out.hookSpecificOutput?.permissionDecisionReason ?? "").includes(BRANDED));
 });
 
+// -- (c2) Qwen named alongside a client that cannot ask ------------------------
+
+for (const [label, env] of [
+  ["ACP_CLIENT=qwen-code + ACP_HARNESS=codex", { ACP_CLIENT: "qwen-code", ACP_HARNESS: "codex" }],
+  ["ACP_CLIENT=cursor + ACP_HARNESS=qwen-code", { ACP_CLIENT: "cursor", ACP_HARNESS: "qwen-code" }],
+]) {
+  test(`(c2) ${label}: claim false, no native_ask, a gateway ask becomes deny`, async () => {
+    nextResponse = askVerdict();
+    const out = await runHook(preToolUse(), { env });
+    const body = toolUse();
+    assertNoClaim(body);
+    assert.equal(out.hookSpecificOutput?.permissionDecision, "deny");
+    assert.ok((out.hookSpecificOutput?.permissionDecisionReason ?? "").startsWith(BRANDED));
+  });
+}
+
 // -- (d) test override is test-only --------------------------------------------
 
 // Spawn the hook with NO dev base override file, so it can only aim at the

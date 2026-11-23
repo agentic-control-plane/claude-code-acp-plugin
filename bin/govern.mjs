@@ -309,7 +309,10 @@ const QWEN_MODES = new Set(["default", "plan", "auto_edit", "auto", "yolo"]);
 function qwenAttended(payload) {
   const mode = typeof payload.permission_mode === "string" ? payload.permission_mode : undefined;
   let why = null;
-  if (!mode || !QWEN_MODES.has(mode)) why = "its permission mode is unknown";
+  // Mixed environment (Qwen named alongside Codex or Cursor): any other
+  // can't-ask signal wins, exactly as CANT_ASK would without Qwen.
+  if (HARNESS === "codex" || NO_ASK_CLIENT) why = "another client that cannot ask is also named";
+  else if (!mode || !QWEN_MODES.has(mode)) why = "its permission mode is unknown";
   // Stricter than detectAgentTier on purpose: any non-empty CI (even
   // "false"/"0") means nobody is claimed present. Failing toward deny is safe.
   else if (process.env.CI !== undefined && process.env.CI !== "") why = "this is a CI run";
@@ -1496,7 +1499,9 @@ async function handlePreToolUse() {
   // Qwen: can THIS call be asked? Claim true behaves like a harness that can
   // ask, claim false like one that cannot. Everyone else: the module constant.
   const qwen = IS_QWEN ? qwenAttended(input) : null;
-  const canAsk = qwen ? qwen.attended.claim : !CANT_ASK;
+  // Belt and braces: the Qwen claim already folds in the other can't-ask
+  // signals, and they are checked again here so no path can loosen them.
+  const canAsk = qwen ? (qwen.attended.claim && HARNESS !== "codex" && !NO_ASK_CLIENT) : !CANT_ASK;
   const body = JSON.stringify({
     tool_name: input.tool_name,
     tool_input: input.tool_input,
