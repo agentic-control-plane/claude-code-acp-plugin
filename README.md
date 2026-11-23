@@ -32,6 +32,8 @@ The plugin registers a **PreToolUse hook** that fires before every tool call:
 3. It returns `allow`, `ask` or `deny`.
 4. Every call is logged, to `~/.acp/audit.jsonl` on-device or to your workspace's audit trail when connected.
 
+Teammates in a Claude Code agent team are governed as subagents, like Task-spawned subagents, because a teammate is an agent, not the human: their calls get subagent-tier policy and they can't file `/acp` workspace changes.
+
 ### If ACP is unreachable
 
 Interactive sessions proceed with a loud `UNGOVERNED` warning, and the floors below still apply. Subagent, background and API sessions stay blocked until the gateway answers.

@@ -128,6 +128,18 @@ test("Task-spawned subagent (agent_id on hook input) reports subagent", async ()
   assert.equal(sentTier(), "subagent");
 });
 
+// Claude Code also sets agent_id / agent_type for in-process teammates in an
+// agent team. A teammate is an agent, not the human, so it gets the
+// subagent tier too; there is no separate teammate tier.
+test("in-process teammate (agent_id + agent_type on hook input) reports subagent", async () => {
+  await hook(
+    pre({ permission_mode: "default", agent_id: "researcher@my-team", agent_type: "researcher" }),
+    { CLAUDE_CODE_ENTRYPOINT: "cli" },
+  );
+  assert.equal(sentTier(), "subagent");
+  assert.deepEqual(captured[0].body.tier_signals, { entrypoint: "cli", agentId: true });
+});
+
 test("a subagent inside a headless run is still unattended — background wins", async () => {
   await hook(pre({ agent_id: "agent-abc" }), { CLAUDE_CODE_ENTRYPOINT: "sdk-cli" });
   assert.equal(sentTier(), "background");
