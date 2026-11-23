@@ -19,7 +19,7 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const GOVERN = join(ROOT, "bin", "govern.mjs");
 const ADDR = ["jane.doe", "acme-corp.dev"].join("@");
 
-let HOME, server, baseUrl, HOOK_ENV;
+let HOME, server, baseUrl;
 let nextResponse = {};
 let lastBody = null;
 
@@ -27,10 +27,6 @@ before(async () => {
   HOME = mkdtempSync(join(tmpdir(), "acp-pii-rewrite-test-"));
   mkdirSync(join(HOME, ".acp"), { recursive: true });
   writeFileSync(join(HOME, ".acp", "credentials"), "gsk_test_deadbeef\n");
-  // Qwen's native_ask depends on a terminal; pin it. These must reach the hook
-  // verbatim (_dev-base.mjs strips ACP_TEST_DEV_BASE from the spawn env).
-  HOOK_ENV = join(HOME, "hook.env");
-  writeFileSync(HOOK_ENV, "ACP_TEST_DEV_BASE=1\nACP_TEST_TTY=1\n");
   server = createServer((req, res) => {
     let raw = "";
     req.on("data", (c) => { raw += c; });
@@ -75,8 +71,10 @@ function run(event, harness, response, { tool = "Bash", toolInput = { command: "
     ...(event === "PostToolUse" && toolResponse !== undefined ? { tool_response: toolResponse } : {}),
   };
   return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [`--env-file=${HOOK_ENV}`, GOVERN], {
-      env: { HOME, PATH: process.env.PATH, ACP_TEST_DEV_BASE: "1", ACP_GOVERN_BASE: baseUrl, ...HARNESS[harness] },
+    // ACP_TEST_TTY=1 pins Qwen's terminal check (its native_ask depends on
+    // it); honoured because _dev-base.mjs writes the dev base override file.
+    const child = spawn(process.execPath, [GOVERN], {
+      env: { HOME, PATH: process.env.PATH, ACP_TEST_DEV_BASE: "1", ACP_GOVERN_BASE: baseUrl, ACP_TEST_TTY: "1", ...HARNESS[harness] },
       stdio: ["pipe", "pipe", "pipe"],
     });
     let stdout = "", stderr = "";

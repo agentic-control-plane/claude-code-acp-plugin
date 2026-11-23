@@ -13,17 +13,17 @@
 //   b. no terminal / CI / subagent / missing or unknown mode → claim false,
 //      no native_ask, ask becomes deny carrying the gateway reason.
 //   c. the same under ACP_HARNESS=qwen-code.
-//   d. ACP_TEST_TTY is ignored without ACP_TEST_DEV_BASE=1.
+//   d. ACP_TEST_TTY is ignored unless the ~/.acp/dev_base_override file is
+//      active; no env var (ACP_TEST_DEV_BASE included) can enable it.
 //   e. a gateway timeout or error never produces "ask".
 //
-// The hook must see ACP_TEST_DEV_BASE / ACP_TEST_TTY verbatim, but
-// _dev-base.mjs strips ACP_TEST_DEV_BASE from the spawn env; those two travel
-// in a node --env-file instead.
+// ACP_TEST_TTY pins the terminal check; _dev-base.mjs writes the dev base
+// override file, which is what lets the hook honour it.
 
 import { test, before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
@@ -77,23 +77,15 @@ beforeEach(() => {
   hang = false;
 });
 
-let envFiles = 0;
-function hookEnvArgs(vars) {
-  if (!vars) return [];
-  const path = join(HOME, `hook-${++envFiles}.env`);
-  writeFileSync(path, Object.entries(vars).map(([k, v]) => `${k}=${v}`).join("\n") + "\n");
-  return [`--env-file=${path}`];
-}
-
-const TTY = { ACP_TEST_DEV_BASE: "1", ACP_TEST_TTY: "1" };
-const NO_TTY = { ACP_TEST_DEV_BASE: "1", ACP_TEST_TTY: "0" };
+const TTY = { ACP_TEST_TTY: "1" };
+const NO_TTY = { ACP_TEST_TTY: "0" };
 const QWEN = { ACP_CLIENT: "qwen-code" };
 
 // NOTE: async spawn, not spawnSync — the stub server lives in THIS process.
 // `detached` gives the hook its own session, i.e. no controlling terminal.
 function runHook(input, { env = QWEN, hookEnv = TTY, detached = false } = {}) {
   return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [...hookEnvArgs(hookEnv), GOVERN], {
+    const child = spawn(process.execPath, [GOVERN], {
       env: {
         HOME,
         PATH: process.env.PATH,
@@ -101,6 +93,7 @@ function runHook(input, { env = QWEN, hookEnv = TTY, detached = false } = {}) {
         CLAUDE_CODE_ENTRYPOINT: "cli",
         ACP_FIRST_ATTEMPT_MS: "1000",
         ACP_RETRY_ATTEMPT_MS: "1000",
+        ...hookEnv,
         ...env,
       },
       stdio: ["pipe", "pipe", "pipe"],
@@ -203,6 +196,33 @@ test("(b) subagent (agent_id in the payload): claim false, no native_ask", async
   assertNoClaim(toolUse());
 });
 
+test("(b) a non-string agent_id still counts as a subagent: claim false", async () => {
+  for (const agentId of [7, 0, { id: "x" }, ["a"], true]) {
+    seen = [];
+    nextResponse = askVerdict();
+    const out = await runHook(preToolUse({ agent_id: agentId }));
+    assertNoClaim(toolUse());
+    assert.equal(out.hookSpecificOutput?.permissionDecision, "deny", JSON.stringify(agentId));
+  }
+  // An empty or null agent_id is no subagent (control).
+  for (const agentId of ["", null]) {
+    seen = [];
+    await runHook(preToolUse({ agent_id: agentId }));
+    assert.equal(toolUse().attended.claim, true, JSON.stringify(agentId));
+  }
+});
+
+test("(b) any non-empty CI, even CI=false or CI=0, means claim false", async () => {
+  for (const ci of ["false", "0", "true"]) {
+    seen = [];
+    await runHook(preToolUse(), { env: { ...QWEN, CI: ci } });
+    assertNoClaim(toolUse());
+  }
+  seen = [];
+  await runHook(preToolUse(), { env: { ...QWEN, CI: "" } });
+  assert.equal(toolUse().attended.claim, true);
+});
+
 test("(b) missing permission_mode: claim false, no native_ask", async () => {
   const input = preToolUse();
   delete input.permission_mode;
@@ -222,6 +242,7 @@ test("(b) claim false: a gateway ask becomes a deny carrying the gateway reason 
     ["there is no terminal", { hookEnv: NO_TTY }],
     ["this is a CI run", { env: { ...QWEN, CI: "1" } }],
     ["this is a subagent", { input: { agent_id: "agent-7" } }],
+    ["its permission mode is unknown", { input: { permission_mode: "bypassPermissions" } }],
   ]) {
     nextResponse = askVerdict();
     const out = await runHook(preToolUse(opts.input), opts);
@@ -259,16 +280,81 @@ test("(c) ACP_HARNESS=qwen-code: claim true asks, claim false denies", async () 
 
 // -- (d) test override is test-only --------------------------------------------
 
-test("(d) ACP_TEST_TTY is ignored without ACP_TEST_DEV_BASE=1", async () => {
+// Spawn the hook with NO dev base override file, so it can only aim at the
+// production gateway (which _no-prod-fetch.mjs blocks). A recorder preload,
+// loaded after the no-prod guard so it wraps it, writes each request body to a
+// file before the guard rejects the call. ACP_TEST_DEV_BASE=1 travels in a
+// node --env-file so it reaches the hook verbatim, as a wrapper script's
+// environment would.
+function runHookNoDevBase(input, hookEnv, extraEnv = {}) {
+  const home = mkdtempSync(join(tmpdir(), "acp-qwen-no-dev-base-"));
+  mkdirSync(join(home, ".acp"), { recursive: true });
+  writeFileSync(join(home, ".acp", "credentials"), "gsk_test_deadbeef\n");
+  const record = join(home, "bodies.jsonl");
+  const recorder = join(home, "recorder.mjs");
+  writeFileSync(recorder, [
+    'import { appendFileSync } from "node:fs";',
+    "const inner = globalThis.fetch;",
+    "globalThis.fetch = (url, init) => {",
+    "  try { appendFileSync(process.env.ACP_TEST_RECORD, String(init?.body ?? '') + '\\n'); } catch {}",
+    "  return inner(url, init);",
+    "};",
+  ].join("\n"));
+  const envFile = join(home, "hook.env");
+  writeFileSync(envFile, Object.entries(hookEnv).map(([k, v]) => `${k}=${v}`).join("\n") + "\n");
+  const noProd = `--import=${new URL("./_no-prod-fetch.mjs", import.meta.url).href}`;
+  const recorderImport = `--import=${new URL(`file://${recorder}`).href}`;
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [`--env-file=${envFile}`, GOVERN], {
+      env: {
+        HOME: home,
+        PATH: process.env.PATH,
+        NODE_OPTIONS: `${noProd} ${recorderImport}`,
+        ACP_TEST_RECORD: record,
+        ACP_FIRST_ATTEMPT_MS: "300",
+        ACP_RETRY_ATTEMPT_MS: "300",
+        ...QWEN,
+        ...extraEnv,
+      },
+      stdio: ["pipe", "pipe", "pipe"],
+      detached: true,
+    });
+    let stdout = "";
+    const killer = setTimeout(() => child.kill("SIGKILL"), 15000);
+    child.stdout.on("data", (c) => { stdout += c; });
+    child.on("error", reject);
+    child.on("close", () => {
+      clearTimeout(killer);
+      try {
+        assert.ok(!existsSync(join(home, ".acp", "dev_base_override")), "this spawn must have no dev base file");
+        const bodies = existsSync(record)
+          ? readFileSync(record, "utf8").split("\n").filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean)
+          : [];
+        resolve({ out: stdout.trim() ? JSON.parse(stdout) : null, bodies });
+      } catch (e) {
+        reject(e);
+      } finally {
+        rmSync(home, { recursive: true, force: true });
+      }
+    });
+    child.stdin.write(JSON.stringify(input));
+    child.stdin.end();
+  });
+}
+
+test("(d) ACP_TEST_TTY is honoured only while the dev base override file is active", async () => {
   // Detached (POSIX setsid): the hook has no controlling terminal, so the real
   // check says no.
-  // With the gate, the override wins (control) ...
-  await runHook(preToolUse(), { hookEnv: { ACP_TEST_DEV_BASE: "1", ACP_TEST_TTY: "1" }, detached: true });
-  assert.equal(toolUse().attended.claim, true);
-  // ... without it, ACP_TEST_TTY=1 changes nothing.
-  seen = [];
+  // With the dev base file, the override wins (control) ...
   await runHook(preToolUse(), { hookEnv: { ACP_TEST_TTY: "1" }, detached: true });
-  assertNoClaim(toolUse());
+  assert.equal(toolUse().attended.claim, true);
+  // ... and without it, environment variables alone change nothing.
+  const { out, bodies } = await runHookNoDevBase(preToolUse(), { ACP_TEST_DEV_BASE: "1", ACP_TEST_TTY: "1" });
+  const body = bodies.find((b) => b.tool_name === "Bash" && b.attended);
+  assert.ok(body, "expected the recorder to capture the PreToolUse body");
+  assertNoClaim(body);
+  assert.equal(body.attended.mode, "default");
+  assert.notEqual(out?.hookSpecificOutput?.permissionDecision, "ask");
 });
 
 // -- (e) outage never asks -----------------------------------------------------

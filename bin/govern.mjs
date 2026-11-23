@@ -287,9 +287,11 @@ const CANT_ASK_NAME = HARNESS === "codex" ? "Codex"
 
 // Does this hook process have a controlling terminal? Qwen's payload and env
 // say nothing about being interactive, so a terminal is the honest signal.
-// Test-only override: ACP_TEST_TTY=1/0, honoured only with ACP_TEST_DEV_BASE=1.
+// Dev/test-only override: ACP_TEST_TTY=1/0, honoured only while the
+// ~/.acp/dev_base_override file is active (same gate as the gateway base
+// override above). An env var alone can never turn the claim true.
 function hasTerminal() {
-  if (process.env.ACP_TEST_DEV_BASE === "1" && /^[01]$/.test(process.env.ACP_TEST_TTY ?? "")) {
+  if (ACP_DEV_BASE !== undefined && /^[01]$/.test(process.env.ACP_TEST_TTY ?? "")) {
     return process.env.ACP_TEST_TTY === "1";
   }
   try {
@@ -308,8 +310,11 @@ function qwenAttended(payload) {
   const mode = typeof payload.permission_mode === "string" ? payload.permission_mode : undefined;
   let why = null;
   if (!mode || !QWEN_MODES.has(mode)) why = "its permission mode is unknown";
+  // Stricter than detectAgentTier on purpose: any non-empty CI (even
+  // "false"/"0") means nobody is claimed present. Failing toward deny is safe.
   else if (process.env.CI !== undefined && process.env.CI !== "") why = "this is a CI run";
-  else if (typeof payload.agent_id === "string" && payload.agent_id) why = "this is a subagent";
+  // Any present agent_id, whatever its type, counts as a subagent (fail closed).
+  else if (payload.agent_id !== undefined && payload.agent_id !== null && payload.agent_id !== "") why = "this is a subagent";
   else if (!hasTerminal()) why = "there is no terminal";
   return {
     attended: { claim: why === null, source: "permission_mode", ...(mode ? { mode: mode.slice(0, 32) } : {}) },
