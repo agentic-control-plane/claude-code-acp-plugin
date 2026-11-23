@@ -19,7 +19,7 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const GOVERN = join(ROOT, "bin", "govern.mjs");
 const ADDR = ["jane.doe", "acme-corp.dev"].join("@");
 
-let HOME, server, baseUrl;
+let HOME, server, baseUrl, HOOK_ENV;
 let nextResponse = {};
 let lastBody = null;
 
@@ -27,6 +27,10 @@ before(async () => {
   HOME = mkdtempSync(join(tmpdir(), "acp-pii-rewrite-test-"));
   mkdirSync(join(HOME, ".acp"), { recursive: true });
   writeFileSync(join(HOME, ".acp", "credentials"), "gsk_test_deadbeef\n");
+  // Qwen's native_ask depends on a terminal; pin it. These must reach the hook
+  // verbatim (_dev-base.mjs strips ACP_TEST_DEV_BASE from the spawn env).
+  HOOK_ENV = join(HOME, "hook.env");
+  writeFileSync(HOOK_ENV, "ACP_TEST_DEV_BASE=1\nACP_TEST_TTY=1\n");
   server = createServer((req, res) => {
     let raw = "";
     req.on("data", (c) => { raw += c; });
@@ -66,10 +70,12 @@ function run(event, harness, response, { tool = "Bash", toolInput = { command: "
     tool_name: tool,
     tool_input: toolInput,
     session_id: `sess-pii-${harness}-${event}`,
+    // Qwen always sends one; without it the hook claims nobody can be asked.
+    ...(harness === "qwen" && event === "PreToolUse" ? { permission_mode: "default" } : {}),
     ...(event === "PostToolUse" && toolResponse !== undefined ? { tool_response: toolResponse } : {}),
   };
   return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [GOVERN], {
+    const child = spawn(process.execPath, [`--env-file=${HOOK_ENV}`, GOVERN], {
       env: { HOME, PATH: process.env.PATH, ACP_TEST_DEV_BASE: "1", ACP_GOVERN_BASE: baseUrl, ...HARNESS[harness] },
       stdio: ["pipe", "pipe", "pipe"],
     });
@@ -99,7 +105,7 @@ const pre = (extra) => ({ decision: "allow", pii: REDACTED_PII, notice: PII_LINE
 // -- capability declaration ------------------------------------------------
 
 test("PreToolUse: input_rewrite only for outside-party tools, per harness", async () => {
-  const mcp = { claude: ["native_ask", "input_rewrite"], codex: [], qwen: ["input_rewrite"], cursor: [], copilot: ["native_ask"], vscode: ["native_ask"] };
+  const mcp = { claude: ["native_ask", "input_rewrite"], codex: [], qwen: ["native_ask", "input_rewrite"], cursor: [], copilot: ["native_ask"], vscode: ["native_ask"] };
   for (const [h, caps] of Object.entries(mcp)) {
     const { body } = await run("PreToolUse", h, { decision: "allow" }, { tool: MCP, toolInput: MCP_IN });
     assert.deepEqual(body.capabilities, caps, h);

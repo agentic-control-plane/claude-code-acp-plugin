@@ -126,7 +126,7 @@ const ACP_GOVERN = ACP_DEV_BASE ?? resolveAcpBase(
 // hook is also installed standalone (~/.acp/govern.mjs) with no plugin.json
 // beside it. Agreement with plugin.json / marketplace.json is enforced by
 // scripts/validate-manifest.mjs and test/plugin-version.test.mjs.
-const PLUGIN_VERSION = "0.33.0";
+const PLUGIN_VERSION = "0.34.0";
 
 // Console base for user-facing deep links (session receipt, #606; enrolment
 // hint). Validated like the gateway bases: a poisoned value would otherwise
@@ -264,20 +264,58 @@ const SHADOW_OFF = /^(off|0|false)$/i.test(process.env.ACP_SHADOW ?? "");
 const HARNESS = process.env.ACP_HARNESS || "claude-code";
 
 // Qwen Code and Cursor run THIS script (acp-install sets ACP_CLIENT=qwen-code
-// / cursor, not ACP_HARNESS, so HARNESS above stays "claude-code"). Neither
-// renders an ACP "ask": Qwen Code silently denies it (QwenLM/qwen-code#6321)
-// and Cursor does not enforce it. They must not declare native_ask, and an
-// "ask" verdict becomes a deny carrying the gateway's reason — never an allow.
+// / cursor, not ACP_HARNESS, so HARNESS above stays "claude-code"). Cursor
+// does not enforce an ACP "ask": it must not declare native_ask, and an "ask"
+// verdict becomes a deny carrying the gateway's reason — never an allow.
 // Either env var may identify them; ACP_HARNESS wins nothing over ACP_CLIENT,
 // any match counts (gatewaystack-connect#1518).
-const NO_ASK_CLIENT = /^(qwen-code|cursor)$/i.test(process.env.ACP_CLIENT ?? "")
-  || /^(qwen-code|cursor)$/i.test(process.env.ACP_HARNESS ?? "");
+const NO_ASK_CLIENT = /^cursor$/i.test(process.env.ACP_CLIENT ?? "")
+  || /^cursor$/i.test(process.env.ACP_HARNESS ?? "");
+// Qwen Code renders a hook "ask" as its own confirmation dialog, in every
+// approval mode (YOLO too), and turns it into a deny itself when it cannot
+// prompt. Whether THIS call can be asked is decided per call (qwenAttended);
+// the local-only floors and offline policy below still treat Qwen as unable
+// to ask, so nothing there is looser than before.
+const IS_QWEN = /^qwen-code$/i.test(process.env.ACP_CLIENT ?? "")
+  || /^qwen-code$/i.test(process.env.ACP_HARNESS ?? "");
 // True when this harness cannot render an "ask": ask maps to deny.
-const CANT_ASK = HARNESS === "codex" || NO_ASK_CLIENT;
+const CANT_ASK = HARNESS === "codex" || NO_ASK_CLIENT || IS_QWEN;
 // True only for genuine Claude Code (not Codex/Copilot/Qwen/Cursor).
-const IS_CLAUDE_CODE = HARNESS === "claude-code" && !NO_ASK_CLIENT;
+const IS_CLAUDE_CODE = HARNESS === "claude-code" && !NO_ASK_CLIENT && !IS_QWEN;
 const CANT_ASK_NAME = HARNESS === "codex" ? "Codex"
   : /cursor/i.test(`${process.env.ACP_CLIENT ?? ""} ${process.env.ACP_HARNESS ?? ""}`) ? "Cursor" : "Qwen Code";
+
+// Does this hook process have a controlling terminal? Qwen's payload and env
+// say nothing about being interactive, so a terminal is the honest signal.
+// Test-only override: ACP_TEST_TTY=1/0, honoured only with ACP_TEST_DEV_BASE=1.
+function hasTerminal() {
+  if (process.env.ACP_TEST_DEV_BASE === "1" && /^[01]$/.test(process.env.ACP_TEST_TTY ?? "")) {
+    return process.env.ACP_TEST_TTY === "1";
+  }
+  try {
+    closeSync(openSync(process.platform === "win32" ? "CONIN$" : "/dev/tty", "r"));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+const QWEN_MODES = new Set(["default", "plan", "auto_edit", "auto", "yolo"]);
+// Qwen's attended claim for one call. True only for a known permission_mode,
+// outside CI, not in a subagent, with a terminal. No auto_approve: no Qwen
+// mode answers a hook ask by itself. `why` names the reason for a false claim.
+function qwenAttended(payload) {
+  const mode = typeof payload.permission_mode === "string" ? payload.permission_mode : undefined;
+  let why = null;
+  if (!mode || !QWEN_MODES.has(mode)) why = "its permission mode is unknown";
+  else if (process.env.CI !== undefined && process.env.CI !== "") why = "this is a CI run";
+  else if (typeof payload.agent_id === "string" && payload.agent_id) why = "this is a subagent";
+  else if (!hasTerminal()) why = "there is no terminal";
+  return {
+    attended: { claim: why === null, source: "permission_mode", ...(mode ? { mode: mode.slice(0, 32) } : {}) },
+    why,
+  };
+}
 
 // ── GitHub Copilot: one registration, two dialects ─────────────────────
 // Copilot CLI reads ~/.copilot/hooks/*.json. PascalCase event names in that
@@ -1450,6 +1488,10 @@ async function handlePreToolUse() {
   // Context guard: the gateway cannot see this machine's files, so the
   // hook measures what a whole-file read would pull in and sends it along.
   const toolContext = await readContext(input);
+  // Qwen: can THIS call be asked? Claim true behaves like a harness that can
+  // ask, claim false like one that cannot. Everyone else: the module constant.
+  const qwen = IS_QWEN ? qwenAttended(input) : null;
+  const canAsk = qwen ? qwen.attended.claim : !CANT_ASK;
   const body = JSON.stringify({
     tool_name: input.tool_name,
     tool_input: input.tool_input,
@@ -1468,15 +1510,18 @@ async function handlePreToolUse() {
     // The gateway keys native ask off this declaration plus the
     // server-resolved tier, permission_mode, and the harness_ask rollout
     // (govern/harnessAsk.ts, server-side). Never sent on PostToolUse.
-    // Qwen Code / Cursor (CANT_ASK) declare nothing for the same reason.
+    // Cursor (CANT_ASK) declares nothing for the same reason; Qwen Code only
+    // when its attended claim for this call is true.
     // input_rewrite: this harness applies a rewritten tool_input (see
     // rewriteCapabilities); declared per harness and per call.
-    capabilities: [...(CANT_ASK ? [] : ["native_ask"]), ...rewriteCapabilities(input.tool_name)],
+    capabilities: [...(canAsk ? ["native_ask"] : []), ...rewriteCapabilities(input.tool_name)],
     // Explicit attended claim (gateway parseAttended, harnessAsk.ts). Claude
-    // Code only; omitted when the payload carries no permission_mode.
+    // Code: omitted when the payload carries no permission_mode. Qwen Code:
+    // always sent, false unless qwenAttended says a human can be asked.
     ...(IS_CLAUDE_CODE && typeof input.permission_mode === "string" && input.permission_mode
       ? { attended: { claim: !/^(dontAsk|bypassPermissions)$/.test(input.permission_mode), source: "permission_mode", mode: input.permission_mode } }
       : {}),
+    ...(qwen ? { attended: qwen.attended } : {}),
     ...(toolContext ? { tool_context: toolContext } : {}),
   });
 
@@ -1702,12 +1747,14 @@ async function handlePreToolUse() {
     // Codex has no ask semantic on the wire (see HARNESS note): emit deny
     // with the approval deep link so the human approves out-of-band and
     // the re-run passes under the grant.
-    const decision = CANT_ASK ? "deny" : "ask";
+    const decision = canAsk ? "ask" : "deny";
     // Codex sees this as a hard deny, so it needs the out-of-band route
     // spelled out; Claude Code renders a prompt and the human answers it.
-    const steer = decision === "deny"
-      ? `${CANT_ASK_NAME} cannot ask mid-run, so this arrives as a block. A human approves it on the dashboard and the re-run passes under the grant — continue with the rest of your task meanwhile.`
-      : "A human is being asked now in this terminal. This holds ONE operation, not your task; if they say no, do not retry the same command — do something else or ask them.";
+    const steer = decision === "ask"
+      ? "A human is being asked now in this terminal. This holds ONE operation, not your task; if they say no, do not retry the same command — do something else or ask them."
+      : qwen
+        ? `Qwen Code cannot ask here (${qwen.why}), so this arrives as a block. Approve it in the ACP console, then run it again.`
+        : `${CANT_ASK_NAME} cannot ask mid-run, so this arrives as a block. A human approves it on the dashboard and the re-run passes under the grant — continue with the rest of your task meanwhile.`;
     // Newer gateways brand the reason themselves ("ACP (Agentic Control
     // Plane) asks: …", gsc#1372); prepend only for older ones so the dialog
     // never shows a double prefix.

@@ -71,10 +71,20 @@ beforeEach(() => {
   nextResponse = { decision: "allow" };
 });
 
+// Variables the HOOK must see verbatim. _dev-base.mjs strips ACP_TEST_DEV_BASE
+// from the spawn env, so these travel in a node --env-file instead.
+let envFiles = 0;
+function hookEnvArgs(vars) {
+  if (!vars) return [];
+  const path = join(HOME, `hook-${++envFiles}.env`);
+  writeFileSync(path, Object.entries(vars).map(([k, v]) => `${k}=${v}`).join("\n") + "\n");
+  return [`--env-file=${path}`];
+}
+
 // NOTE: async spawn, not spawnSync — the stub server lives in THIS process.
-function runHook(input, env = {}) {
+function runHook(input, env = {}, hookEnv = null) {
   return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [GOVERN], {
+    const child = spawn(process.execPath, [...hookEnvArgs(hookEnv), GOVERN], {
       env: {
         HOME,
         PATH: process.env.PATH,
@@ -212,16 +222,13 @@ test("(f) Claude Code sends an explicit attended claim alongside permission_mode
 });
 
 for (const [label, env] of [
-  ["qwen-code via ACP_CLIENT", { ACP_CLIENT: "qwen-code" }],
   ["cursor via ACP_CLIENT", { ACP_CLIENT: "cursor" }],
-  ["qwen-code via ACP_HARNESS", { ACP_HARNESS: "qwen-code" }],
   ["cursor via ACP_HARNESS", { ACP_HARNESS: "cursor" }],
 ]) {
   test(`(g) ${label}: no native_ask, no attended`, async () => {
     await runHook(preToolUse(), env);
     const req = seen.find((s) => s.url === "/govern/tool-use");
     assert.ok(req, "expected a request to /govern/tool-use");
-    // Bash input is never rewritten, so even qwen-code declares nothing here.
     assert.deepEqual(req.body.capabilities, []);
     assert.equal(Object.prototype.hasOwnProperty.call(req.body, "attended"), false);
   });
@@ -230,6 +237,34 @@ for (const [label, env] of [
     nextResponse = { decision: "ask", reason: "step_up for Bash.git needs review", approval_id: "ap9", approval_status: "pending" };
     const out = await runHook(preToolUse(), env);
     assert.ok(out, "expected output on stdout");
+    assert.equal(out.hookSpecificOutput?.permissionDecision, "deny");
+    assert.match(out.hookSpecificOutput?.permissionDecisionReason ?? "", /step_up for Bash\.git needs review/);
+  });
+}
+
+// Qwen Code renders a hook ask as its own confirmation prompt; whether THIS
+// call may be asked is its attended claim (full matrix in qwen-native-ask).
+const TTY = { ACP_TEST_DEV_BASE: "1", ACP_TEST_TTY: "1" };
+const NO_TTY = { ACP_TEST_DEV_BASE: "1", ACP_TEST_TTY: "0" };
+for (const [label, env] of [
+  ["qwen-code via ACP_CLIENT", { ACP_CLIENT: "qwen-code" }],
+  ["qwen-code via ACP_HARNESS", { ACP_HARNESS: "qwen-code" }],
+]) {
+  test(`(i) ${label}: with a terminal, native_ask + attended claim, and an ask stays an ask`, async () => {
+    nextResponse = { decision: "ask", reason: "step_up for Bash.git needs review", approval_id: "ap10", approval_status: "pending" };
+    const out = await runHook(preToolUse(), env, TTY);
+    const req = seen.find((s) => s.url === "/govern/tool-use");
+    assert.deepEqual(req.body.capabilities, ["native_ask"]);
+    assert.deepEqual(req.body.attended, { claim: true, source: "permission_mode", mode: "default" });
+    assert.equal(out.hookSpecificOutput?.permissionDecision, "ask");
+  });
+
+  test(`(j) ${label}: without a terminal, no native_ask and an ask becomes deny with the gateway reason`, async () => {
+    nextResponse = { decision: "ask", reason: "step_up for Bash.git needs review", approval_id: "ap11", approval_status: "pending" };
+    const out = await runHook(preToolUse(), env, NO_TTY);
+    const req = seen.find((s) => s.url === "/govern/tool-use");
+    assert.deepEqual(req.body.capabilities, []);
+    assert.equal(req.body.attended.claim, false);
     assert.equal(out.hookSpecificOutput?.permissionDecision, "deny");
     assert.match(out.hookSpecificOutput?.permissionDecisionReason ?? "", /step_up for Bash\.git needs review/);
   });
