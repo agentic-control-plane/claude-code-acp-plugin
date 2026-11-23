@@ -66,11 +66,15 @@ function run(event, harness, response, { tool = "Bash", toolInput = { command: "
     tool_name: tool,
     tool_input: toolInput,
     session_id: `sess-pii-${harness}-${event}`,
+    // Qwen always sends one; without it the hook claims nobody can be asked.
+    ...(harness === "qwen" && event === "PreToolUse" ? { permission_mode: "default" } : {}),
     ...(event === "PostToolUse" && toolResponse !== undefined ? { tool_response: toolResponse } : {}),
   };
   return new Promise((resolve, reject) => {
+    // ACP_TEST_TTY=1 pins Qwen's terminal check (its native_ask depends on
+    // it); honoured because _dev-base.mjs writes the dev base override file.
     const child = spawn(process.execPath, [GOVERN], {
-      env: { HOME, PATH: process.env.PATH, ACP_TEST_DEV_BASE: "1", ACP_GOVERN_BASE: baseUrl, ...HARNESS[harness] },
+      env: { HOME, PATH: process.env.PATH, ACP_TEST_DEV_BASE: "1", ACP_GOVERN_BASE: baseUrl, ACP_TEST_TTY: "1", ...HARNESS[harness] },
       stdio: ["pipe", "pipe", "pipe"],
     });
     let stdout = "", stderr = "";
@@ -99,7 +103,7 @@ const pre = (extra) => ({ decision: "allow", pii: REDACTED_PII, notice: PII_LINE
 // -- capability declaration ------------------------------------------------
 
 test("PreToolUse: input_rewrite only for outside-party tools, per harness", async () => {
-  const mcp = { claude: ["native_ask", "input_rewrite"], codex: [], qwen: ["input_rewrite"], cursor: [], copilot: ["native_ask"], vscode: ["native_ask"] };
+  const mcp = { claude: ["native_ask", "input_rewrite"], codex: [], qwen: ["native_ask", "input_rewrite"], cursor: [], copilot: ["native_ask"], vscode: ["native_ask"] };
   for (const [h, caps] of Object.entries(mcp)) {
     const { body } = await run("PreToolUse", h, { decision: "allow" }, { tool: MCP, toolInput: MCP_IN });
     assert.deepEqual(body.capabilities, caps, h);

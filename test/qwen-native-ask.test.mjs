@@ -1,0 +1,395 @@
+// Qwen Code: a gateway "ask" becomes Qwen's own confirmation prompt when a
+// human can be asked, and a deny when nobody can.
+//
+// Run with: node --test test/qwen-native-ask.test.mjs
+//
+// Qwen runs the shared hook with ACP_CLIENT=qwen-code. Per PreToolUse call the
+// hook sends attended: { claim, source: "permission_mode", mode } and declares
+// native_ask only when the claim is true. The claim is true only for a known
+// permission_mode, CI unset, no agent_id (not a subagent) and a controlling
+// terminal. Invariants under test:
+//   a. claim true → native_ask declared, attended claim true, ask stays ask
+//      with the gateway reason unchanged at the front.
+//   b. no terminal / CI / subagent / missing or unknown mode → claim false,
+//      no native_ask, ask becomes deny carrying the gateway reason.
+//   c. the same under ACP_HARNESS=qwen-code.
+//   d. ACP_TEST_TTY is ignored unless the ~/.acp/dev_base_override file is
+//      active; no env var (ACP_TEST_DEV_BASE included) can enable it.
+//   e. a gateway timeout or error never produces "ask".
+//
+// ACP_TEST_TTY pins the terminal check; _dev-base.mjs writes the dev base
+// override file, which is what lets the hook honour it.
+
+import { test, before, after, beforeEach } from "node:test";
+import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } from "node:fs";
+import { createServer } from "node:http";
+import { tmpdir } from "node:os";
+import { join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
+import "./_dev-base.mjs";
+
+const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
+const GOVERN = join(ROOT, "bin", "govern.mjs");
+
+let HOME;
+let server;
+let baseUrl;
+let seen = [];
+// What the stub answers next: a JSON body, an HTTP status, or no answer at all.
+let nextResponse = { decision: "allow" };
+let nextStatus = 200;
+let hang = false;
+
+before(async () => {
+  HOME = mkdtempSync(join(tmpdir(), "acp-qwen-native-ask-test-"));
+  mkdirSync(join(HOME, ".acp"), { recursive: true });
+  writeFileSync(join(HOME, ".acp", "credentials"), "gsk_test_deadbeef\n");
+
+  server = createServer((req, res) => {
+    let raw = "";
+    req.on("data", (c) => { raw += c; });
+    req.on("end", () => {
+      let body = null;
+      try { body = JSON.parse(raw); } catch { /* keep null */ }
+      seen.push({ url: req.url, body });
+      if (hang && req.url === "/govern/tool-use") return; // never answer
+      res.statusCode = nextStatus;
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify(nextResponse));
+    });
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  baseUrl = `http://127.0.0.1:${server.address().port}`;
+});
+
+after(() => {
+  server?.closeAllConnections?.();
+  server?.close();
+  rmSync(HOME, { recursive: true, force: true });
+});
+
+beforeEach(() => {
+  seen = [];
+  nextResponse = { decision: "allow" };
+  nextStatus = 200;
+  hang = false;
+});
+
+const TTY = { ACP_TEST_TTY: "1" };
+const NO_TTY = { ACP_TEST_TTY: "0" };
+const QWEN = { ACP_CLIENT: "qwen-code" };
+
+// NOTE: async spawn, not spawnSync — the stub server lives in THIS process.
+// `detached` gives the hook its own session, i.e. no controlling terminal.
+function runHook(input, { env = QWEN, hookEnv = TTY, detached = false } = {}) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [GOVERN], {
+      env: {
+        HOME,
+        PATH: process.env.PATH,
+        ACP_TEST_DEV_BASE: "1", ACP_GOVERN_BASE: baseUrl,
+        CLAUDE_CODE_ENTRYPOINT: "cli",
+        ACP_FIRST_ATTEMPT_MS: "1000",
+        ACP_RETRY_ATTEMPT_MS: "1000",
+        ...hookEnv,
+        ...env,
+      },
+      stdio: ["pipe", "pipe", "pipe"],
+      detached,
+    });
+    let stdout = "";
+    let stderr = "";
+    const killer = setTimeout(() => child.kill("SIGKILL"), 15000);
+    child.stdout.on("data", (c) => { stdout += c; });
+    child.stderr.on("data", (c) => { stderr += c; });
+    child.on("error", reject);
+    child.on("close", (status) => {
+      clearTimeout(killer);
+      try {
+        assert.equal(status, 0, `hook exited ${status}: ${stderr}`);
+        resolve(stdout.trim() ? JSON.parse(stdout) : null);
+      } catch (e) {
+        reject(e);
+      }
+    });
+    child.stdin.write(JSON.stringify(input));
+    child.stdin.end();
+  });
+}
+
+const preToolUse = (overrides = {}) => ({
+  hook_event_name: "PreToolUse",
+  tool_name: "Bash",
+  tool_input: { command: "echo probe" },
+  tool_use_id: "call-qwen-ask-1",
+  session_id: "sess-qwen-ask",
+  cwd: "/tmp",
+  permission_mode: "default",
+  ...overrides,
+});
+
+const toolUse = () => {
+  const req = seen.find((s) => s.url === "/govern/tool-use");
+  assert.ok(req, "expected a request to /govern/tool-use");
+  return req.body;
+};
+
+const BRANDED = "ACP (Agentic Control Plane) asks: step_up by interactive tier policy for Bash.echo.";
+const askVerdict = () => ({ decision: "ask", reason: BRANDED, approval_id: "apq", approval_status: "pending" });
+
+// -- (a) claim true ------------------------------------------------------------
+
+for (const mode of ["default", "yolo"]) {
+  test(`(a) permission_mode ${mode} with a terminal: attended claim true and native_ask`, async () => {
+    await runHook(preToolUse({ permission_mode: mode }));
+    const body = toolUse();
+    assert.deepEqual(body.attended, { claim: true, source: "permission_mode", mode });
+    assert.ok(body.capabilities.includes("native_ask"));
+    assert.equal(body.permission_mode, mode);
+  });
+}
+
+test("(a) plan, auto_edit and auto also claim true", async () => {
+  for (const mode of ["plan", "auto_edit", "auto"]) {
+    seen = [];
+    await runHook(preToolUse({ permission_mode: mode }));
+    const body = toolUse();
+    assert.deepEqual(body.attended, { claim: true, source: "permission_mode", mode }, mode);
+    assert.ok(body.capabilities.includes("native_ask"), mode);
+  }
+});
+
+test("(a) claim true: a gateway ask is Qwen's own prompt, gateway reason first and unchanged", async () => {
+  nextResponse = askVerdict();
+  const out = await runHook(preToolUse({ permission_mode: "yolo" }));
+  assert.equal(out.hookSpecificOutput?.hookEventName, "PreToolUse");
+  assert.equal(out.hookSpecificOutput?.permissionDecision, "ask");
+  const reason = out.hookSpecificOutput?.permissionDecisionReason ?? "";
+  assert.ok(reason.startsWith(BRANDED), `reason should open with the gateway's text, got: ${reason}`);
+  assert.match(reason, /A human is being asked now in this terminal/);
+});
+
+// -- (b) claim false -----------------------------------------------------------
+
+function assertNoClaim(body) {
+  assert.equal(body.attended?.claim, false);
+  assert.equal(body.attended?.source, "permission_mode");
+  assert.ok(!body.capabilities.includes("native_ask"));
+}
+
+test("(b) no terminal: claim false, no native_ask", async () => {
+  await runHook(preToolUse(), { hookEnv: NO_TTY });
+  const body = toolUse();
+  assertNoClaim(body);
+  assert.deepEqual(body.attended, { claim: false, source: "permission_mode", mode: "default" });
+});
+
+test("(b) CI=1: claim false, no native_ask", async () => {
+  await runHook(preToolUse(), { env: { ...QWEN, CI: "1" } });
+  assertNoClaim(toolUse());
+});
+
+test("(b) subagent (agent_id in the payload): claim false, no native_ask", async () => {
+  await runHook(preToolUse({ agent_id: "agent-7" }));
+  assertNoClaim(toolUse());
+});
+
+test("(b) a non-string agent_id still counts as a subagent: claim false", async () => {
+  for (const agentId of [7, 0, { id: "x" }, ["a"], true]) {
+    seen = [];
+    nextResponse = askVerdict();
+    const out = await runHook(preToolUse({ agent_id: agentId }));
+    assertNoClaim(toolUse());
+    assert.equal(out.hookSpecificOutput?.permissionDecision, "deny", JSON.stringify(agentId));
+  }
+  // An empty or null agent_id is no subagent (control).
+  for (const agentId of ["", null]) {
+    seen = [];
+    await runHook(preToolUse({ agent_id: agentId }));
+    assert.equal(toolUse().attended.claim, true, JSON.stringify(agentId));
+  }
+});
+
+test("(b) any non-empty CI, even CI=false or CI=0, means claim false", async () => {
+  for (const ci of ["false", "0", "true"]) {
+    seen = [];
+    await runHook(preToolUse(), { env: { ...QWEN, CI: ci } });
+    assertNoClaim(toolUse());
+  }
+  seen = [];
+  await runHook(preToolUse(), { env: { ...QWEN, CI: "" } });
+  assert.equal(toolUse().attended.claim, true);
+});
+
+test("(b) missing permission_mode: claim false, no native_ask", async () => {
+  const input = preToolUse();
+  delete input.permission_mode;
+  await runHook(input);
+  assertNoClaim(toolUse());
+});
+
+test("(b) unknown permission_mode: claim false, no native_ask", async () => {
+  await runHook(preToolUse({ permission_mode: "bypassPermissions" }));
+  const body = toolUse();
+  assertNoClaim(body);
+  assert.equal(body.attended.mode, "bypassPermissions");
+});
+
+test("(b) claim false: a gateway ask becomes a deny carrying the gateway reason and why", async () => {
+  for (const [why, opts] of [
+    ["there is no terminal", { hookEnv: NO_TTY }],
+    ["this is a CI run", { env: { ...QWEN, CI: "1" } }],
+    ["this is a subagent", { input: { agent_id: "agent-7" } }],
+    ["its permission mode is unknown", { input: { permission_mode: "bypassPermissions" } }],
+  ]) {
+    nextResponse = askVerdict();
+    const out = await runHook(preToolUse(opts.input), opts);
+    assert.equal(out.hookSpecificOutput?.permissionDecision, "deny", why);
+    const reason = out.hookSpecificOutput?.permissionDecisionReason ?? "";
+    assert.ok(reason.startsWith(BRANDED), `${why}: ${reason}`);
+    assert.ok(reason.includes(`Qwen Code cannot ask here (${why}), so this arrives as a block. Approve it in the ACP console, then run it again.`), `${why}: ${reason}`);
+  }
+  // An unbranded gateway reason is still carried unchanged.
+  nextResponse = { decision: "ask", reason: "step_up for Bash.echo needs review", approval_id: "apq2", approval_status: "pending" };
+  const out = await runHook(preToolUse(), { hookEnv: NO_TTY });
+  assert.equal(out.hookSpecificOutput?.permissionDecision, "deny");
+  assert.ok((out.hookSpecificOutput?.permissionDecisionReason ?? "").includes("step_up for Bash.echo needs review"));
+});
+
+// -- (c) identified by ACP_HARNESS ---------------------------------------------
+
+test("(c) ACP_HARNESS=qwen-code: claim true asks, claim false denies", async () => {
+  const env = { ACP_HARNESS: "qwen-code" };
+  nextResponse = askVerdict();
+  let out = await runHook(preToolUse({ permission_mode: "yolo" }), { env });
+  let body = toolUse();
+  assert.deepEqual(body.attended, { claim: true, source: "permission_mode", mode: "yolo" });
+  assert.ok(body.capabilities.includes("native_ask"));
+  assert.equal(out.hookSpecificOutput?.permissionDecision, "ask");
+  assert.ok((out.hookSpecificOutput?.permissionDecisionReason ?? "").startsWith(BRANDED));
+
+  seen = [];
+  out = await runHook(preToolUse(), { env, hookEnv: NO_TTY });
+  body = toolUse();
+  assertNoClaim(body);
+  assert.equal(out.hookSpecificOutput?.permissionDecision, "deny");
+  assert.ok((out.hookSpecificOutput?.permissionDecisionReason ?? "").includes(BRANDED));
+});
+
+// -- (c2) Qwen named alongside a client that cannot ask ------------------------
+
+for (const [label, env] of [
+  ["ACP_CLIENT=qwen-code + ACP_HARNESS=codex", { ACP_CLIENT: "qwen-code", ACP_HARNESS: "codex" }],
+  ["ACP_CLIENT=cursor + ACP_HARNESS=qwen-code", { ACP_CLIENT: "cursor", ACP_HARNESS: "qwen-code" }],
+]) {
+  test(`(c2) ${label}: claim false, no native_ask, a gateway ask becomes deny`, async () => {
+    nextResponse = askVerdict();
+    const out = await runHook(preToolUse(), { env });
+    const body = toolUse();
+    assertNoClaim(body);
+    assert.equal(out.hookSpecificOutput?.permissionDecision, "deny");
+    assert.ok((out.hookSpecificOutput?.permissionDecisionReason ?? "").startsWith(BRANDED));
+  });
+}
+
+// -- (d) test override is test-only --------------------------------------------
+
+// Spawn the hook with NO dev base override file, so it can only aim at the
+// production gateway (which _no-prod-fetch.mjs blocks). A recorder preload,
+// loaded after the no-prod guard so it wraps it, writes each request body to a
+// file before the guard rejects the call. ACP_TEST_DEV_BASE=1 travels in a
+// node --env-file so it reaches the hook verbatim, as a wrapper script's
+// environment would.
+function runHookNoDevBase(input, hookEnv, extraEnv = {}) {
+  const home = mkdtempSync(join(tmpdir(), "acp-qwen-no-dev-base-"));
+  mkdirSync(join(home, ".acp"), { recursive: true });
+  writeFileSync(join(home, ".acp", "credentials"), "gsk_test_deadbeef\n");
+  const record = join(home, "bodies.jsonl");
+  const recorder = join(home, "recorder.mjs");
+  writeFileSync(recorder, [
+    'import { appendFileSync } from "node:fs";',
+    "const inner = globalThis.fetch;",
+    "globalThis.fetch = (url, init) => {",
+    "  try { appendFileSync(process.env.ACP_TEST_RECORD, String(init?.body ?? '') + '\\n'); } catch {}",
+    "  return inner(url, init);",
+    "};",
+  ].join("\n"));
+  const envFile = join(home, "hook.env");
+  writeFileSync(envFile, Object.entries(hookEnv).map(([k, v]) => `${k}=${v}`).join("\n") + "\n");
+  const noProd = `--import=${new URL("./_no-prod-fetch.mjs", import.meta.url).href}`;
+  const recorderImport = `--import=${new URL(`file://${recorder}`).href}`;
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [`--env-file=${envFile}`, GOVERN], {
+      env: {
+        HOME: home,
+        PATH: process.env.PATH,
+        NODE_OPTIONS: `${noProd} ${recorderImport}`,
+        ACP_TEST_RECORD: record,
+        ACP_FIRST_ATTEMPT_MS: "300",
+        ACP_RETRY_ATTEMPT_MS: "300",
+        ...QWEN,
+        ...extraEnv,
+      },
+      stdio: ["pipe", "pipe", "pipe"],
+      detached: true,
+    });
+    let stdout = "";
+    const killer = setTimeout(() => child.kill("SIGKILL"), 15000);
+    child.stdout.on("data", (c) => { stdout += c; });
+    child.on("error", reject);
+    child.on("close", () => {
+      clearTimeout(killer);
+      try {
+        assert.ok(!existsSync(join(home, ".acp", "dev_base_override")), "this spawn must have no dev base file");
+        const bodies = existsSync(record)
+          ? readFileSync(record, "utf8").split("\n").filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean)
+          : [];
+        resolve({ out: stdout.trim() ? JSON.parse(stdout) : null, bodies });
+      } catch (e) {
+        reject(e);
+      } finally {
+        rmSync(home, { recursive: true, force: true });
+      }
+    });
+    child.stdin.write(JSON.stringify(input));
+    child.stdin.end();
+  });
+}
+
+test("(d) ACP_TEST_TTY is honoured only while the dev base override file is active", async () => {
+  // Detached (POSIX setsid): the hook has no controlling terminal, so the real
+  // check says no.
+  // With the dev base file, the override wins (control) ...
+  await runHook(preToolUse(), { hookEnv: { ACP_TEST_TTY: "1" }, detached: true });
+  assert.equal(toolUse().attended.claim, true);
+  // ... and without it, environment variables alone change nothing.
+  const { out, bodies } = await runHookNoDevBase(preToolUse(), { ACP_TEST_DEV_BASE: "1", ACP_TEST_TTY: "1" });
+  const body = bodies.find((b) => b.tool_name === "Bash" && b.attended);
+  assert.ok(body, "expected the recorder to capture the PreToolUse body");
+  assertNoClaim(body);
+  assert.equal(body.attended.mode, "default");
+  assert.notEqual(out?.hookSpecificOutput?.permissionDecision, "ask");
+});
+
+// -- (e) outage never asks -----------------------------------------------------
+
+test("(e) a gateway error or timeout under Qwen never produces ask", async () => {
+  nextStatus = 500;
+  nextResponse = { decision: "ask", reason: BRANDED };
+  let out = await runHook(preToolUse());
+  assert.notEqual(out?.hookSpecificOutput?.permissionDecision, "ask");
+
+  nextStatus = 200;
+  hang = true;
+  out = await runHook(preToolUse(), {
+    env: { ...QWEN, ACP_FIRST_ATTEMPT_MS: "300", ACP_RETRY_ATTEMPT_MS: "300" },
+  });
+  assert.notEqual(out?.hookSpecificOutput?.permissionDecision, "ask");
+  // At an unattended tier the outage stays a deny.
+  out = await runHook(preToolUse({ agent_id: "agent-7" }), {
+    env: { ...QWEN, ACP_FIRST_ATTEMPT_MS: "300", ACP_RETRY_ATTEMPT_MS: "300" },
+  });
+  assert.equal(out?.hookSpecificOutput?.permissionDecision, "deny");
+});
