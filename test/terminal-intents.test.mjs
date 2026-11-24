@@ -15,7 +15,8 @@
 //   c. /acp-status → GET .../status; reason starts with the mode line and
 //      lists a proposal's /acp-apply hint.
 //   d. A non-ACP command never triggers a request or output.
-//   e. A subagent (agent_id set) never triggers a request or output.
+//   e. A subagent (agent_id set), including an agent-team teammate, never
+//      triggers a request or output.
 //   f. No credentials in HOME → blocked with an /acp-connect hint, no
 //      request made.
 //   g. 404 not-rolled-out → blocked mentioning the workspace isn't on it.
@@ -308,6 +309,18 @@ test("(d) a non-ACP command never triggers a request or any output", async () =>
 test("(e) a subagent (agent_id set) never triggers a request or any output", async () => {
   const out = await runHook(expansion({ agent_id: "sub-1" }));
   assert.equal(out, null);
+  assert.equal(seen.length, 0);
+});
+
+test("(e2) an in-process teammate (agent_id + agent_type) can't file /acp workspace changes", async () => {
+  const teammate = { agent_id: "researcher@my-team", agent_type: "researcher" };
+  for (const [command_name, command_args] of [
+    ["agentic-control-plane:acp-enforce", ""],
+    ["agentic-control-plane:acp-allow", "Bash.git-push"],
+  ]) {
+    const out = await runHook(expansion({ ...teammate, command_name, command_args }));
+    assert.equal(out, null, command_name);
+  }
   assert.equal(seen.length, 0);
 });
 
